@@ -1,32 +1,13 @@
-"""Comparação ALNS (biblioteca `alns`) vs ILS (biblioteca `pyvrp`) vs GLS (OR-Tools).
+"""Comparação ALNS (com polimento PyVRP C++) vs ILS (com PyVRP C++) vs GLS / TS (OR-Tools desvinculado até N).
 
 Requisitos:
     pip install vrplib numpy ortools alns pyvrp
-
-IMPORTANTE — leia antes de correr em produção:
-    A classe `IteratedLocalSearch` descrita em https://pyvrp.org/dev/algorithm.html
-    ainda NÃO existe na linha estável instalada (testado com pyvrp==0.11.3,
-    Python 3.10 — nessa versão o motor de topo é `GeneticAlgorithm`, estilo HGS).
-    Por isso o ILS aqui é construído à mão: um laço de perturbação + aceitação
-    escrito em Python (igual ao `ils()` original), mas a busca local em si usa
-    o motor compilado do PyVRP (`pyvrp.search.LocalSearch` — 2-opt, Or-opt,
-    exchange, etc.), muito mais rico e rápido que o `two_opt` caseiro.
-
-    Os nomes exatos de `pyvrp.search` usados abaixo (NODE_OPERATORS,
-    ROUTE_OPERATORS, compute_neighbours, NeighbourhoodParams) foram
-    reconstruídos a partir dos notebooks/documentação públicos do PyVRP para
-    a linha 0.x — NÃO testados localmente contra a tua instalação exata. Se
-    der erro, corre primeiro:
-
-        python -c "import pyvrp.search as s; print([n for n in dir(s) if not n.startswith('_')])"
-        python -c "import pyvrp; print([n for n in dir(pyvrp) if not n.startswith('_')])"
-
-    e cola-me o output para eu ajustar.
 """
 from __future__ import annotations
 
 import argparse
 import csv
+import math
 import random
 import time
 from collections import defaultdict
@@ -45,8 +26,20 @@ from alns.select import RouletteWheel
 from alns.stop import MaxRuntime as AlnsMaxRuntime
 import numpy.random as rnd
 
-# --- ILS (biblioteca externa: pip install pyvrp) ---------------------------
+# --- PyVRP C++ Local Search (pip install pyvrp) ---------------------------
 import pyvrp
+from pyvrp import RandomNumberGenerator, CostEvaluator, Solution
+from pyvrp.search import (
+    LocalSearch,
+    NeighbourhoodParams,
+    compute_neighbours,
+    NODE_OPERATORS,
+    ROUTE_OPERATORS,
+)
+
+# --- OR-Tools (pip install ortools) ---------------------------------------
+from ortools.constraint_solver import pywrapcp, routing_enums_pb2
+from ortools.util.optional_boolean_pb2 import BOOL_TRUE
 
 
 @dataclass
@@ -118,39 +111,46 @@ def pci(instance: Instance) -> list[list[int]]:
     return routes
 
 
-def two_opt(route: list[int], distance: np.ndarray) -> list[int]:
-    """2-opt intra-rota; usado só para polir rotas dentro do repair do ALNS."""
-    best = route[:]
-    best_cost = route_cost(best, distance)
-    improved = True
-    while improved:
-        improved = False
-        for left in range(len(best) - 1):
-            for right in range(left + 1, len(best)):
-                candidate = best[:left] + best[left:right + 1][::-1] + best[right + 1:]
-                cost = route_cost(candidate, distance)
-                if cost + 1e-9 < best_cost:
-                    best, best_cost, improved = candidate, cost, True
-    return best
+def validate_solution(routes: list[list[int]], demand: np.ndarray, capacity: float, n_nodes: int, algo_name: str = "") -> None:
+    """Valida estritamente a capacidade de todos os veículos e cobertura completa dos clientes."""
+    for r_idx, r in enumerate(routes):
+        load = sum(demand[node] for node in r)
+        if load > capacity + 1e-6:
+            raise ValueError(f"[{algo_name}] Violação de capacidade na rota {r_idx}: {load:.2f} > {capacity:.2f}")
+    visited = [node for r in routes for node in r]
+    expected = set(range(1, n_nodes))
+    if len(visited) != len(set(visited)):
+        import collections
+        dups = [item for item, count in collections.Counter(visited).items() if count > 1]
+        raise ValueError(f"[{algo_name}] Clientes duplicados detectados: {dups}")
+    if set(visited) != expected:
+        missing = expected - set(visited)
+        raise ValueError(f"[{algo_name}] Clientes faltantes detectados: {missing}")
+
+
+def create_pyvrp_local_search(vrp_path: Path, seed: int):
+    """Cria e inicializa o motor LocalSearch em C++ do PyVRP com todos os 13 operadores."""
+    data = pyvrp.read(str(vrp_path), round_func="round")
+    rng = RandomNumberGenerator(seed=seed)
+    neighbours = compute_neighbours(data, NeighbourhoodParams())
+    ls = LocalSearch(data, rng, neighbours)
+    for op in NODE_OPERATORS:
+        ls.add_node_operator(op(data))
+    for op in ROUTE_OPERATORS:
+        ls.add_route_operator(op(data))
+    cost_eval = CostEvaluator(load_penalties=[10000], tw_penalty=0, dist_penalty=0)
+    return data, ls, cost_eval
 
 
 # ---------------------------------------------------------------------------
-# ALNS — biblioteca `alns` (Ropke & Pisinger, via N-Wouda & Lan, JOSS 2023)
+# ALNS — com polimento de busca local PyVRP em C++
 # ---------------------------------------------------------------------------
 
 class CvrpState:
-    """Estado do ALNS: uma solução (lista de rotas) + clientes por reinserir.
-
-    A biblioteca `alns` espera que os operadores de destroy/repair tenham a
-    assinatura `op(state, rng) -> state` (sem devolver a lista de removidos
-    à parte) — por isso os clientes removidos ficam guardados em
-    `state.unassigned`, e é isso que o repair operator lê.
-    """
-
     __slots__ = ("routes", "unassigned", "instance")
 
     def __init__(self, routes: list[list[int]], instance: Instance, unassigned: list[int] | None = None):
-        self.routes = routes
+        self.routes = [r[:] for r in routes if r]
         self.instance = instance
         self.unassigned = unassigned if unassigned is not None else []
 
@@ -158,141 +158,392 @@ class CvrpState:
         return solution_cost(self.routes, self.instance.distance)
 
     def copy(self) -> "CvrpState":
-        return CvrpState([route[:] for route in self.routes], self.instance, list(self.unassigned))
+        return CvrpState(self.routes, self.instance, list(self.unassigned))
 
 
-def random_route_removal(state: CvrpState, rng: rnd.Generator, degree: float = 0.15) -> CvrpState:
-    """Operador de destruição: remove ~`degree` dos clientes de cada rota."""
+def destroy_random(state: CvrpState, rng: rnd.Generator, degree: float = 0.15) -> CvrpState:
     new_state = state.copy()
-    removed: list[int] = []
-    for route in new_state.routes:
-        if not route:
-            continue
-        count = max(1, int(degree * len(route)))
-        for _ in range(min(count, len(route))):
-            removed.append(route.pop(int(rng.integers(len(route)))))
+    all_custs = [c for r in new_state.routes for c in r]
+    if not all_custs:
+        return new_state
+    count = max(2, int(degree * len(all_custs)))
+    chosen = rng.choice(all_custs, size=min(count, len(all_custs)), replace=False)
+    chosen_set = set(chosen)
+    new_state.routes = [[c for c in r if c not in chosen_set] for r in new_state.routes]
+    new_state.routes = [r for r in new_state.routes if r]
+    new_state.unassigned = list(chosen)
+    return new_state
+
+
+def destroy_worst(state: CvrpState, rng: rnd.Generator, degree: float = 0.15, p: float = 3.0) -> CvrpState:
+    new_state = state.copy()
+    removals: list[tuple[float, int]] = []
+    dist = new_state.instance.distance
+    for r in new_state.routes:
+        r_c = route_cost(r, dist)
+        for pos, c in enumerate(r):
+            sub_r = r[:pos] + r[pos + 1:]
+            savings = r_c - route_cost(sub_r, dist)
+            removals.append((savings, c))
+    removals.sort(key=lambda x: x[0], reverse=True)
+    if not removals:
+        return new_state
+    count = max(2, int(degree * len(removals)))
+    chosen: list[int] = []
+    for _ in range(min(count, len(removals))):
+        idx = int((rng.random() ** p) * len(removals))
+        chosen.append(removals.pop(min(idx, len(removals) - 1))[1])
+    chosen_set = set(chosen)
+    new_state.routes = [[c for c in r if c not in chosen_set] for r in new_state.routes]
+    new_state.routes = [r for r in new_state.routes if r]
+    new_state.unassigned = chosen
+    return new_state
+
+
+def destroy_shaw(state: CvrpState, rng: rnd.Generator, degree: float = 0.15, p: float = 4.0) -> CvrpState:
+    new_state = state.copy()
+    all_custs = [c for r in new_state.routes for c in r]
+    if not all_custs:
+        return new_state
+    count = max(2, int(degree * len(all_custs)))
+    dist = new_state.instance.distance
+    dem = new_state.instance.demand
+    max_d = float(np.max(dist)) if np.max(dist) > 0 else 1.0
+    max_q = float(np.max(dem)) if np.max(dem) > 0 else 1.0
+
+    first = int(rng.choice(all_custs))
+    removed = [first]
+    while len(removed) < count and len(removed) < len(all_custs):
+        ref = int(rng.choice(removed))
+        candidates = [c for c in all_custs if c not in removed]
+        candidates.sort(key=lambda c: 0.8 * (dist[ref, c] / max_d) + 0.2 * (abs(dem[ref] - dem[c]) / max_q))
+        idx = int((rng.random() ** p) * len(candidates))
+        removed.append(candidates[min(idx, len(candidates) - 1)])
+    rem_set = set(removed)
+    new_state.routes = [[c for c in r if c not in rem_set] for r in new_state.routes]
+    new_state.routes = [r for r in new_state.routes if r]
     new_state.unassigned = removed
     return new_state
 
 
-def greedy_repair(state: CvrpState, rng: rnd.Generator) -> CvrpState:
-    """Operador de reparação: reinsere `state.unassigned` pelo menor custo, com 2-opt final."""
+def destroy_route(state: CvrpState, rng: rnd.Generator) -> CvrpState:
     new_state = state.copy()
-    order = list(new_state.unassigned)
-    rng.shuffle(order)
-    for customer in order:
-        best = None
-        for route_index, route in enumerate(new_state.routes):
-            if route_load(route, new_state.instance.demand) + new_state.instance.demand[customer] > new_state.instance.capacity:
-                continue
-            for position in range(len(route) + 1):
-                before = 0 if position == 0 else route[position - 1]
-                after = 0 if position == len(route) else route[position]
-                increase = (new_state.instance.distance[before, customer] + new_state.instance.distance[customer, after]
-                            - new_state.instance.distance[before, after])
-                candidate = (increase, route_index, position)
-                if best is None or candidate < best:
-                    best = candidate
-        if best is None:
-            new_state.routes.append([customer])
-        else:
-            _, route_index, position = best
-            new_state.routes[route_index].insert(position, customer)
-    new_state.routes = [two_opt(route, new_state.instance.distance) for route in new_state.routes if route]
-    new_state.unassigned = []
+    if not new_state.routes:
+        return new_state
+    n_remove = 1 if len(new_state.routes) <= 3 else int(rng.integers(1, 3))
+    removed_custs: list[int] = []
+    for _ in range(n_remove):
+        if not new_state.routes:
+            break
+        r_idx = int(rng.integers(len(new_state.routes)))
+        removed_custs.extend(new_state.routes.pop(r_idx))
+    new_state.unassigned = removed_custs
     return new_state
 
 
+def destroy_string(state: CvrpState, rng: rnd.Generator, degree: float = 0.15) -> CvrpState:
+    """String Removal (SISR - Christiaens & Vanden Berghe, 2020).
+    Remove subsequências contíguas de clientes em rotas selecionadas,
+    abrindo janelas limpas para inserção de blocos sem cruzamento de arestas."""
+    new_state = state.copy()
+    all_custs = [c for r in new_state.routes for c in r]
+    if not all_custs or not new_state.routes:
+        return new_state
+
+    target_count = max(2, int(degree * len(all_custs)))
+    removed_custs: list[int] = []
+
+    route_indices = list(range(len(new_state.routes)))
+    rng.shuffle(route_indices)
+
+    for r_idx in route_indices:
+        if len(removed_custs) >= target_count:
+            break
+        route = new_state.routes[r_idx]
+        if not route:
+            continue
+        max_string_len = min(len(route), max(2, int(0.4 * len(route))))
+        string_len = int(rng.integers(1, max_string_len + 1))
+        string_len = min(string_len, target_count - len(removed_custs))
+        if string_len <= 0:
+            continue
+        start_pos = int(rng.integers(0, len(route) - string_len + 1))
+        string_extracted = route[start_pos:start_pos + string_len]
+        removed_custs.extend(string_extracted)
+        new_state.routes[r_idx] = route[:start_pos] + route[start_pos + string_len:]
+
+    new_state.routes = [r for r in new_state.routes if r]
+    new_state.unassigned = removed_custs
+    return new_state
+
+
+def make_repair_operators(pyvrp_data, pyvrp_ls, pyvrp_cost_eval):
+    def pyvrp_polish(routes: list[list[int]]) -> list[list[int]]:
+        valid_r = [r for r in routes if r]
+        if not valid_r:
+            return routes
+        sol = Solution(pyvrp_data, valid_r)
+        polished = pyvrp_ls.search(sol, pyvrp_cost_eval)
+        if polished.is_feasible():
+            return [[c for c in r] for r in polished.routes()]
+        return valid_r
+
+    def repair_regret2(state: CvrpState, rng: rnd.Generator) -> CvrpState:
+        new_state = state.copy()
+        dist = new_state.instance.distance
+        dem = new_state.instance.demand
+        cap = new_state.instance.capacity
+        unassigned = set(new_state.unassigned)
+        while unassigned:
+            best_regret = -float("inf")
+            best_c = None
+            best_pos_info = None
+            for c in unassigned:
+                cands = []
+                for r_idx, r in enumerate(new_state.routes):
+                    if route_load(r, dem) + dem[c] > cap:
+                        continue
+                    for pos in range(len(r) + 1):
+                        b = 0 if pos == 0 else r[pos - 1]
+                        a = 0 if pos == len(r) else r[pos]
+                        inc = dist[b, c] + dist[c, a] - dist[b, a]
+                        cands.append((inc, r_idx, pos))
+                cands.append((2.0 * dist[0, c], len(new_state.routes), 0))
+                cands.sort(key=lambda x: x[0])
+                first_c = cands[0]
+                second_c = cands[1] if len(cands) > 1 else (first_c[0] + 1000.0, 0, 0)
+                regret = second_c[0] - first_c[0]
+                if regret > best_regret:
+                    best_regret = regret
+                    best_c = c
+                    best_pos_info = first_c
+            if best_c is None:
+                break
+            inc, r_idx, pos = best_pos_info
+            if r_idx == len(new_state.routes):
+                new_state.routes.append([best_c])
+            else:
+                new_state.routes[r_idx].insert(pos, best_c)
+            unassigned.remove(best_c)
+
+        new_state.routes = pyvrp_polish(new_state.routes)
+        new_state.unassigned = []
+        return new_state
+
+    def repair_regret3(state: CvrpState, rng: rnd.Generator) -> CvrpState:
+        new_state = state.copy()
+        dist = new_state.instance.distance
+        dem = new_state.instance.demand
+        cap = new_state.instance.capacity
+        unassigned = set(new_state.unassigned)
+        while unassigned:
+            best_regret = -float("inf")
+            best_c = None
+            best_pos_info = None
+            for c in unassigned:
+                cands = []
+                for r_idx, r in enumerate(new_state.routes):
+                    if route_load(r, dem) + dem[c] > cap:
+                        continue
+                    for pos in range(len(r) + 1):
+                        b = 0 if pos == 0 else r[pos - 1]
+                        a = 0 if pos == len(r) else r[pos]
+                        inc = dist[b, c] + dist[c, a] - dist[b, a]
+                        cands.append((inc, r_idx, pos))
+                cands.append((2.0 * dist[0, c], len(new_state.routes), 0))
+                cands.sort(key=lambda x: x[0])
+                first_c = cands[0]
+                second_c = cands[1] if len(cands) > 1 else (first_c[0] + 500.0, 0, 0)
+                third_c = cands[2] if len(cands) > 2 else (second_c[0] + 500.0, 0, 0)
+                regret = (second_c[0] - first_c[0]) + (third_c[0] - first_c[0])
+                if regret > best_regret:
+                    best_regret = regret
+                    best_c = c
+                    best_pos_info = first_c
+            if best_c is None:
+                break
+            inc, r_idx, pos = best_pos_info
+            if r_idx == len(new_state.routes):
+                new_state.routes.append([best_c])
+            else:
+                new_state.routes[r_idx].insert(pos, best_c)
+            unassigned.remove(best_c)
+
+        new_state.routes = pyvrp_polish(new_state.routes)
+        new_state.unassigned = []
+        return new_state
+
+    def repair_greedy(state: CvrpState, rng: rnd.Generator) -> CvrpState:
+        new_state = state.copy()
+        dist = new_state.instance.distance
+        dem = new_state.instance.demand
+        cap = new_state.instance.capacity
+        order = list(new_state.unassigned)
+        rng.shuffle(order)
+        for c in order:
+            best_cand = None
+            for r_idx, r in enumerate(new_state.routes):
+                if route_load(r, dem) + dem[c] > cap:
+                    continue
+                for pos in range(len(r) + 1):
+                    b = 0 if pos == 0 else r[pos - 1]
+                    a = 0 if pos == len(r) else r[pos]
+                    inc = dist[b, c] + dist[c, a] - dist[b, a]
+                    if best_cand is None or inc < best_cand[0]:
+                        best_cand = (inc, r_idx, pos)
+            if best_cand is None:
+                new_state.routes.append([c])
+            else:
+                new_state.routes[best_cand[1]].insert(best_cand[2], c)
+
+        new_state.routes = pyvrp_polish(new_state.routes)
+        new_state.unassigned = []
+        return new_state
+
+    return repair_regret2, repair_regret3, repair_greedy, pyvrp_polish
+
+
 def run_alns(instance: Instance, seed: int, deadline: float, run_start: float) -> list[tuple[float, float]]:
-    """Corre o ALNS até `deadline`; devolve [(segundos_desde_run_start, custo_incumbente), ...]."""
+    """ALNS com reparação Regret/Shaw e polimento local C++ PyVRP."""
     events: list[tuple[float, float]] = []
+    pyvrp_data, pyvrp_ls, pyvrp_cost_eval = create_pyvrp_local_search(instance.path, seed)
+    repair_regret2, repair_regret3, repair_greedy, pyvrp_polish = make_repair_operators(
+        pyvrp_data, pyvrp_ls, pyvrp_cost_eval
+    )
 
     init_routes = pci(instance)
-    init_state = CvrpState(init_routes, instance)
-    events.append((time.perf_counter() - run_start, init_state.objective()))
+    polished_init = pyvrp_polish(init_routes)
+    init_state = CvrpState(polished_init, instance)
+    best_c = init_state.objective()
+    events.append((time.perf_counter() - run_start, best_c))
 
     budget = max(0.0, deadline - time.perf_counter())
     if budget <= 0:
+        validate_solution(init_state.routes, instance.demand, instance.capacity, len(instance.demand), "ALNS")
         return events
 
     rng = rnd.default_rng(seed)
     solver = ALNS(rng)
-    solver.add_destroy_operator(random_route_removal)
-    solver.add_repair_operator(greedy_repair)
+    solver.add_destroy_operator(destroy_shaw)
+    solver.add_destroy_operator(destroy_worst)
+    solver.add_destroy_operator(destroy_random)
+    solver.add_destroy_operator(destroy_route)
+    solver.add_destroy_operator(destroy_string)
+
+    solver.add_repair_operator(repair_regret2)
+    solver.add_repair_operator(repair_regret3)
+    solver.add_repair_operator(repair_greedy)
 
     def on_best(feasible_state: CvrpState, rng_: rnd.Generator, **_):
-        events.append((time.perf_counter() - run_start, feasible_state.objective()))
+        nonlocal best_c
+        cost = feasible_state.objective()
+        if cost < best_c:
+            best_c = cost
+            events.append((time.perf_counter() - run_start, cost))
 
     solver.on_best(on_best)
-
-    select = RouletteWheel(scores=[25, 5, 1, 0], decay=0.8, num_destroy=1, num_repair=1)
-    # `autofit` espera um número de ITERAÇÕES (não segundos) para calcular o
-    # decaimento linear do threshold. Não sabemos ao certo quantas iterações
-    # cabem no orçamento (varia com o tamanho da instância), por isso usamos
-    # uma estimativa grosseira; ajusta o fator se notares o threshold a
-    # decair depressa/devagar demais para o teu tamanho de instância típico.
-    estimated_iters = max(100, int(budget * 500))
-    accept = RecordToRecordTravel.autofit(init_state.objective(), 0.05, 0.0, estimated_iters)
+    select = RouletteWheel(scores=[25, 10, 2, 0], decay=0.8, num_destroy=5, num_repair=3)
+    estimated_iters = max(100, int(budget * 60))
+    accept = RecordToRecordTravel.autofit(best_c, 0.05, 0.0, estimated_iters)
     stop = AlnsMaxRuntime(budget)
 
-    solver.iterate(init_state, select, accept, stop)
+    res = solver.iterate(init_state, select, accept, stop)
+    final_routes = res.best_state.routes
+    validate_solution(final_routes, instance.demand, instance.capacity, len(instance.demand), "ALNS")
+    events.append((min(budget, time.perf_counter() - run_start), solution_cost(final_routes, instance.distance)))
     return events
 
 
 # ---------------------------------------------------------------------------
-# ILS — biblioteca `pyvrp` (motor C++, estilo HGS-CVRP / Vidal 2022)
+# ILS — Perturbação inteligente + Busca Local PyVRP em C++
 # ---------------------------------------------------------------------------
 
-def routes_from_solution(solution) -> list[list[int]]:
-    """Converte um `pyvrp.Solution` em list[list[int]] (mesmo formato do pci())."""
-    return [[client for client in route] for route in solution.routes()]
-
-
 def run_ils(instance: Instance, seed: int, deadline: float, run_start: float) -> list[tuple[float, float]]:
-    """ILS construído à mão sobre o `LocalSearch` compilado do pyvrp (ver aviso
-    no topo do ficheiro sobre porquê não usamos `pyvrp.IteratedLocalSearch`).
-    Estrutura igual ao `ils()` original: perturbação (relocate) -> busca local
-    -> aceitação -> repete até `deadline`; só a busca local mudou de motor.
-    """
-    from pyvrp import RandomNumberGenerator, CostEvaluator, Solution
-    from pyvrp.search import (
-        LocalSearch,
-        NeighbourhoodParams,
-        compute_neighbours,
-        NODE_OPERATORS,
-        ROUTE_OPERATORS,
-    )
-
     events: list[tuple[float, float]] = []
+    pyvrp_data, pyvrp_ls, pyvrp_cost_eval = create_pyvrp_local_search(instance.path, seed)
+    dist = instance.distance
+    dem = instance.demand
+    cap = instance.capacity
 
     init_routes = pci(instance)
-    events.append((time.perf_counter() - run_start, solution_cost(init_routes, instance.distance)))
+    sol_init = pyvrp_ls.search(Solution(pyvrp_data, [r for r in init_routes if r]), pyvrp_cost_eval)
+    best_routes = [[c for c in r] for r in sol_init.routes()]
+    best_c = solution_cost(best_routes, dist)
+    events.append((time.perf_counter() - run_start, best_c))
 
     budget = max(0.0, deadline - time.perf_counter())
     if budget <= 0:
+        validate_solution(best_routes, dem, cap, len(dem), "ILS")
         return events
 
-    data = pyvrp.read(instance.path, round_func="round")
-    rng = RandomNumberGenerator(seed=seed)
-    neighbours = compute_neighbours(data, NeighbourhoodParams())
-    local_search = LocalSearch(data, rng, neighbours)
-    for op in NODE_OPERATORS:
-        local_search.add_node_operator(op(data))
-    for op in ROUTE_OPERATORS:
-        local_search.add_route_operator(op(data))
+    current = [r[:] for r in best_routes]
+    current_cost = best_c
+    prng = random.Random(seed)
 
-    # Penalidade alta para violação de capacidade — a nossa PCI/perturbação já
-    # garante rotas feasible; isto é só rede de segurança para a busca local.
+    while time.perf_counter() < deadline:
+        cand = [r[:] for r in current]
+        k = prng.randint(2, 4)
+        for _ in range(k):
+            nonempty = [i for i, r in enumerate(cand) if r]
+            if not nonempty:
+                break
+            s_idx = prng.choice(nonempty)
+            c = cand[s_idx].pop(prng.randrange(len(cand[s_idx])))
+            feasible = [i for i, r in enumerate(cand) if route_load(r, dem) + dem[c] <= cap]
+            if feasible:
+                t_idx = prng.choice(feasible)
+                cand[t_idx].insert(prng.randrange(len(cand[t_idx]) + 1), c)
+            else:
+                cand.append([c])
+
+        cand = [r for r in cand if r]
+        sol_cand = pyvrp_ls.search(Solution(pyvrp_data, cand), pyvrp_cost_eval)
+        if sol_cand.is_feasible():
+            cand_routes = [[c for c in r] for r in sol_cand.routes()]
+            c_cost = solution_cost(cand_routes, dist)
+            if c_cost < best_c:
+                best_c = c_cost
+                best_routes = cand_routes
+                events.append((time.perf_counter() - run_start, best_c))
+            if c_cost <= current_cost or prng.random() < 0.05:
+                current = cand_routes
+                current_cost = c_cost
+
+    validate_solution(best_routes, dem, cap, len(dem), "ILS")
+    events.append((min(budget, time.perf_counter() - run_start), best_c))
+    return events
+
+
+def run_ils2(instance: Instance, seed: int, deadline: float, run_start: float) -> list[tuple[float, float]]:
+    """ILS2: Implementação original anterior (1 nó realocado sem filtro prévio de capacidade,
+    com penalidade de carga [1000] no CostEvaluator para traversia infactível e reparação C++)."""
+    events: list[tuple[float, float]] = []
+    pyvrp_data = pyvrp.read(str(instance.path), round_func="round")
+    rng = RandomNumberGenerator(seed=seed)
+    neighbours = compute_neighbours(pyvrp_data, NeighbourhoodParams())
+    local_search = LocalSearch(pyvrp_data, rng, neighbours)
+    for op in NODE_OPERATORS:
+        local_search.add_node_operator(op(pyvrp_data))
+    for op in ROUTE_OPERATORS:
+        local_search.add_route_operator(op(pyvrp_data))
+
     cost_evaluator = CostEvaluator(load_penalties=[1000], tw_penalty=0, dist_penalty=0)
 
-    current = local_search.search(Solution(data, [r for r in init_routes if r]), cost_evaluator)
+    init_routes = pci(instance)
+    current = local_search.search(Solution(pyvrp_data, [r for r in init_routes if r]), cost_evaluator)
     best_distance = current.distance() if current.is_feasible() else float("inf")
+    best_routes = [[c for c in r] for r in current.routes()] if current.is_feasible() else init_routes
     if current.is_feasible():
         events.append((time.perf_counter() - run_start, float(best_distance)))
 
+    budget = max(0.0, deadline - time.perf_counter())
+    if budget <= 0:
+        validate_solution(best_routes, instance.demand, instance.capacity, len(instance.demand), "ILS2")
+        return events
+
     perturb_rng = random.Random(seed)
     while time.perf_counter() < deadline:
-        routes = routes_from_solution(current)
+        routes = [[c for c in r] for r in current.routes()]
         nonempty = [i for i, r in enumerate(routes) if r]
         if nonempty:
             source = perturb_rng.choice(nonempty)
@@ -300,43 +551,44 @@ def run_ils(instance: Instance, seed: int, deadline: float, run_start: float) ->
             target = perturb_rng.randrange(len(routes))
             routes[target].insert(perturb_rng.randrange(len(routes[target]) + 1), customer)
 
-        # `pyvrp.Solution` rejeita rotas vazias na lista (ao contrário do
-        # nosso `solution_cost`/`route_cost`, que toleram `[]`) — a
-        # perturbação pode esvaziar uma rota (ex.: removeu o único cliente
-        # dela), por isso filtramos antes de construir o Solution.
         routes = [r for r in routes if r]
-        candidate = local_search.search(Solution(data, routes), cost_evaluator)
+        candidate = local_search.search(Solution(pyvrp_data, routes), cost_evaluator)
 
-        # A busca local trabalha com custo PENALIZADO (permite atravessar
-        # soluções temporariamente infeasible para escapar de ótimos locais —
-        # técnica standard em HGS/PyVRP). A perturbação acima não valida
-        # capacidade antes de inserir no `target`, por isso o candidato pode
-        # sair infeasible; a busca local tende a corrigi-lo, mas nem sempre.
-        # Para os checkpoints (comparáveis ao BKS) só podemos reportar
-        # DISTÂNCIA PURA de soluções feasible — nunca o custo penalizado.
         if candidate.is_feasible() and candidate.distance() < best_distance:
             best_distance = candidate.distance()
+            best_routes = [[c for c in r] for r in candidate.routes()]
             events.append((time.perf_counter() - run_start, float(best_distance)))
 
         if cost_evaluator.cost(candidate) <= cost_evaluator.cost(current) or perturb_rng.random() < 0.05:
             current = candidate
 
+    validate_solution(best_routes, instance.demand, instance.capacity, len(instance.demand), "ILS2")
+    exact_cost = solution_cost(best_routes, instance.distance)
+    events.append((min(budget, time.perf_counter() - run_start), exact_cost))
     return events
 
 
 # ---------------------------------------------------------------------------
-# GLS — OR-Tools (inalterado)
+# GLS & TS — OR-Tools com frota desvinculada até N
 # ---------------------------------------------------------------------------
 
-def run_gls(instance: Instance, seed: int, deadline: float, run_start: float) -> list[tuple[float, float]]:
-    from ortools.constraint_solver import pywrapcp, routing_enums_pb2
-
+def run_ortools_solver(instance: Instance, seed: int, deadline: float, run_start: float, metaheuristic_name: str) -> list[tuple[float, float]]:
     events: list[tuple[float, float]] = []
     initial_routes = pci(instance)
-    events.append((time.perf_counter() - run_start, solution_cost(initial_routes, instance.distance)))
-    num_vehicles = len(initial_routes)
+    init_cost = solution_cost(initial_routes, instance.distance)
+    events.append((time.perf_counter() - run_start, init_cost))
 
-    manager = pywrapcp.RoutingIndexManager(len(instance.distance), num_vehicles, 0)
+    budget = max(0.0, deadline - time.perf_counter())
+    if budget <= 0:
+        validate_solution(initial_routes, instance.demand, instance.capacity, len(instance.demand), metaheuristic_name)
+        return events
+
+    # Frota flexível desvinculada com folga inteligente (evita inflar o espaço de busca com centenas de rotas vazias)
+    num_nodes = len(instance.distance)
+    k_init = len(initial_routes)
+    num_vehicles = min(num_nodes - 1, max(k_init + 6, int(math.ceil(k_init * 1.3))))
+
+    manager = pywrapcp.RoutingIndexManager(num_nodes, num_vehicles, 0)
     routing = pywrapcp.RoutingModel(manager)
     routing.solver().ReSeed(seed)
 
@@ -353,74 +605,110 @@ def run_gls(instance: Instance, seed: int, deadline: float, run_start: float) ->
     )
 
     parameters = pywrapcp.DefaultRoutingSearchParameters()
-    parameters.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
-    remaining_ms = max(1, int((deadline - time.perf_counter()) * 1000))
+    if metaheuristic_name == "TS":
+        parameters.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.TABU_SEARCH
+    else:
+        parameters.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
+
+    # Operadores avançados de vizinhança inter e intra-rotas
+    parameters.local_search_operators.use_cross_exchange = BOOL_TRUE
+    parameters.local_search_operators.use_full_path_lns = BOOL_TRUE
+    parameters.local_search_operators.use_tsp_opt = BOOL_TRUE
+
+    remaining_ms = max(1, int(budget * 1000))
     parameters.time_limit.FromMilliseconds(remaining_ms)
     routing.CloseModelWithParameters(parameters)
 
-    best_cost = {"value": float("inf")}
+    best_val = {"cost": init_cost}
 
     def on_solution() -> None:
-        cost = routing.CostVar().Value()
-        if cost < best_cost["value"]:
-            best_cost["value"] = float(cost)
-            events.append((time.perf_counter() - run_start, float(cost)))
+        c = routing.CostVar().Value()
+        if c < best_val["cost"]:
+            best_val["cost"] = float(c)
+            events.append((time.perf_counter() - run_start, float(c)))
 
     routing.AddAtSolutionCallback(on_solution)
 
-    initial_assignment = routing.ReadAssignmentFromRoutes(initial_routes, True)
+    # Preenchimento de rotas iniciais para veículos não utilizados (rotas vazias)
+    padded_routes = initial_routes + [[] for _ in range(num_vehicles - len(initial_routes))]
+    initial_assignment = routing.ReadAssignmentFromRoutes(padded_routes, True)
     assignment = routing.SolveFromAssignmentWithParameters(initial_assignment, parameters)
 
-    if assignment is None:
-        events.append((time.perf_counter() - run_start, float("inf")))
-        return events
+    final_routes = []
+    if assignment is not None:
+        for vehicle in range(num_vehicles):
+            index = routing.Start(vehicle)
+            route = []
+            while not routing.IsEnd(index):
+                node = manager.IndexToNode(index)
+                if node:
+                    route.append(node)
+                index = assignment.Value(routing.NextVar(index))
+            if route:
+                final_routes.append(route)
+    else:
+        final_routes = initial_routes
 
-    routes = []
-    for vehicle in range(num_vehicles):
-        index = routing.Start(vehicle)
-        route = []
-        while not routing.IsEnd(index):
-            node = manager.IndexToNode(index)
-            if node:
-                route.append(node)
-            index = assignment.Value(routing.NextVar(index))
-        if route:
-            routes.append(route)
-
-    events.append((time.perf_counter() - run_start, solution_cost(routes, instance.distance)))
+    validate_solution(final_routes, instance.demand, instance.capacity, num_nodes, metaheuristic_name)
+    exact_cost = solution_cost(final_routes, instance.distance)
+    events.append((min(budget, time.perf_counter() - run_start), exact_cost))
     return events
+
+
+def run_gls(instance: Instance, seed: int, deadline: float, run_start: float) -> list[tuple[float, float]]:
+    return run_ortools_solver(instance, seed, deadline, run_start, "GLS")
+
+
+def run_ts(instance: Instance, seed: int, deadline: float, run_start: float) -> list[tuple[float, float]]:
+    return run_ortools_solver(instance, seed, deadline, run_start, "TS")
 
 
 # ---------------------------------------------------------------------------
 # Orquestração / checkpoints / CSV
 # ---------------------------------------------------------------------------
 
-RUNNERS = {"ALNS": run_alns, "ILS": run_ils, "GLS": run_gls}
+RUNNERS = {"ALNS": run_alns, "ILS": run_ils, "ILS2": run_ils2, "GLS": run_gls, "TS": run_ts}
 
 
-def run_one(instance: Instance, algorithm: str, seed: int, seconds_per_customer: float, cap: float) -> list[dict]:
-    budget = min(seconds_per_customer * (len(instance.demand) - 1), cap)
+def run_one(instance: Instance, algorithm: str, seed: int, seconds_per_customer: float, cap: float, fixed_budget: float | None = None) -> list[dict]:
+    if fixed_budget is not None and fixed_budget > 0:
+        budget = float(fixed_budget)
+    else:
+        budget = min(seconds_per_customer * (len(instance.demand) - 1), cap)
     start = time.perf_counter()
     deadline = start + budget
     checkpoints = (0.25, 0.50, 0.75, 1.00)
 
     events = RUNNERS[algorithm](instance, seed, deadline, start)
-    best_final = min((c for _, c in events), default=float("inf"))
+
+    sorted_events = sorted(events, key=lambda x: x[0])
+    running_best = float("inf")
+    monotonic_events: list[tuple[float, float]] = []
+    for t_el, c in sorted_events:
+        if c < running_best:
+            running_best = c
+        monotonic_events.append((t_el, running_best))
 
     rows = []
     for fraction in checkpoints:
         target = budget * fraction
-        values = [cost for elapsed, cost in events if elapsed <= target]
-        rows.append({"instancia_id": instance.instance_id, "algoritmo": algorithm, "seed": seed,
-                     "checkpoint": int(fraction * 100), "elapsed_target_seconds": target,
-                     "cost": min(values) if values else best_final})
+        eligible = [c for t_el, c in monotonic_events if t_el <= target + 0.05]
+        best_at_target = min(eligible) if eligible else running_best
+        rows.append({
+            "instancia_id": instance.instance_id,
+            "algoritmo": algorithm,
+            "seed": seed,
+            "checkpoint": int(fraction * 100),
+            "elapsed_target_seconds": target,
+            "cost": best_at_target
+        })
     return rows
 
 
-def run_job(job: tuple[str, str, int, float, float]) -> list[dict]:
-    path_text, algorithm, seed, seconds_per_customer, cap = job
+def run_job(job: tuple[str, str, int, float, float, float | None]) -> list[dict]:
+    path_text, algorithm, seed, seconds_per_customer, cap, fixed_budget = job
     instance = load_instance(Path(path_text))
-    return run_one(instance, algorithm, seed, seconds_per_customer, cap)
+    return run_one(instance, algorithm, seed, seconds_per_customer, cap, fixed_budget)
 
 
 def main() -> int:
@@ -428,11 +716,13 @@ def main() -> int:
     parser.add_argument("--instances-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path, default=Path("outputs/checkpoint_costs_raw.csv"))
     parser.add_argument("--median-output", type=Path, default=Path("outputs/checkpoint_costs_median.csv"))
-    parser.add_argument("--algorithms", nargs="+", choices=("ALNS", "ILS", "GLS"), default=("ALNS", "ILS", "GLS"))
+    parser.add_argument("--algorithms", nargs="+", choices=("ALNS", "ILS", "ILS2", "GLS", "TS"), default=("ALNS", "ILS", "ILS2", "GLS", "TS"))
     parser.add_argument("--seeds", nargs="+", type=int, default=(1001, 2001, 3001))
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--seconds-per-customer", type=float, default=0.5)
     parser.add_argument("--time-cap", type=float, default=100.0)
+    parser.add_argument("--fixed-budget", type=float, default=None,
+                        help="orçamento fixo em segundos para todas as instâncias (ex: 20.0), garantindo comparação perfeitamente justa independente de N")
     parser.add_argument("--workers", type=int, default=1,
                          help="número de processos worker (default: 1; recomendado: 8)")
     args = parser.parse_args()
@@ -440,7 +730,7 @@ def main() -> int:
         parser.error("--workers deve ser pelo menos 1")
 
     paths = sorted(args.instances_dir.glob("*.vrp"))[:args.limit]
-    jobs = [(str(path), algorithm, seed, args.seconds_per_customer, args.time_cap)
+    jobs = [(str(path), algorithm, seed, args.seconds_per_customer, args.time_cap, args.fixed_budget)
             for path in paths for algorithm in args.algorithms for seed in args.seeds]
 
     rows: list[dict] = []
