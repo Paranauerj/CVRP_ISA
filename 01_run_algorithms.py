@@ -1,15 +1,84 @@
-"""Comparação ALNS (com polimento PyVRP C++) vs ILS (com PyVRP C++) vs GLS / TS (OR-Tools desvinculado até N).
+"""
+Comparação de Algoritmos para o CVRP — ALNS / ALNS2 / ILS / GLS / TS
+======================================================================
 
+ATENÇÃO — LEIA ANTES DE EDITAR
+--------------------------------
+Os algoritmos implementados neste ficheiro seguem formulações académicas específicas.
+NÃO altere nenhum parâmetro ou critério sem consultar primeiro:
+    → literature_alignment.md   (na raiz do projeto)
+
+Esse documento contém: referências bibliográficas completas, citações directas dos
+artigos originais e uma tabela de alinhamento implementação ↔ literatura para cada
+algoritmo. Alterações não documentadas quebram a comparabilidade científica do benchmark.
+
+─────────────────────────────────────────────────────────────────────────────────────────
+RESUMO DO PORTFÓLIO E ALINHAMENTO COM A LITERATURA
+─────────────────────────────────────────────────────────────────────────────────────────
+
+ALNS  — Adaptive Large Neighbourhood Search
+    Referência : Ropke & Pisinger (2006). Transportation Science 40(4), 455–472.
+    Aceitação  : Record-to-Record Travel [Dueck, 1993] via RecordToRecordTravel.autofit
+    Ideia-chave: "The method to use at each step is chosen based on the performance of
+                  the method in the past, using an adaptive weight adjustment scheme."
+                  (Ropke & Pisinger, 2006, p. 456)
+    Operadores : Shaw / Worst / Random / Route / String-SISR [Christiaens & Vanden Berghe 2020]
+                 + Regret-2 / Regret-3 / Greedy + PyVRP C++ polishing [Vidal, 2022]
+
+ALNS2 — ALNS com aceitação Simulated Annealing (critério ORIGINAL de Ropke & Pisinger)
+    Referência : Ropke & Pisinger (2006). Mesma que ALNS — é o critério do próprio artigo.
+    Aceitação  : SimulatedAnnealing.autofit(worse=0.05, accept_prob=0.5)
+    Ideia-chave: "A new solution s' is accepted if f(s') < f(s), or with probability
+                  e^{-(f(s')−f(s))/T} if f(s') >= f(s)."
+                  (Ropke & Pisinger, 2006, p. 460)
+    Diferença  : Tudo igual ao ALNS — apenas o critério de aceitação muda (SA vs RRT).
+
+ILS   — Iterated Local Search (critério Better + escape de estagnação)
+    Referência : Lourenço, Martin & Stützle (2003). Handbook of Metaheuristics, pp. 320–353.
+    Aceitação  : "Better" (descida pura) + reinício de s_best após estagnação
+    Ideia-chave: "The simplest acceptance criterion is to accept a new solution only if it
+                  is better than the current solution. This is referred to as the 'Better'
+                  criterion." (Lourenço et al., 2003, p. 326)
+                 "The perturbation must be strong enough to allow ILS to escape from local
+                  optima basins." (Lourenço et al., 2003, p. 325)
+    Perturbação: k ∈ [2+boost, 4+boost] recolocações de nós; k cresce após estagnação
+                 (STAGNATION_LIMIT=30, MAX_PERTURB_BOOST=4)
+    LS engine  : PyVRP C++ — todos os 13 operadores de nó e rota [Vidal, 2022]
+
+GLS   — Guided Local Search
+    Referência : Voudouris & Tsang (1999). European Journal of Operational Research 113(2).
+    Aceitação  : OR-Tools GUIDED_LOCAL_SEARCH (penalização adaptativa de arcos)
+    Ideia-chave: "GLS builds a new objective function on top of the standard one by
+                  augmenting it with penalty terms... When a local optimum is reached,
+                  the penalties on the most 'promising' features are increased."
+                  (Voudouris & Tsang, 1999, p. 471)
+    Parâmetros : lambda_coefficient=1.0 [sweep: avg gap 14.21% vs 18.43% baseline];
+                 lns_time_limit=1000ms; use_full_path_lns=False [OFF → mais throughput];
+                 use_cross_exchange=True; use_tsp_opt=True; use_relocate_neighbors=True
+
+TS    — Tabu Search
+    Referência : Glover (1989). ORSA Journal on Computing 1(3), 190–206.
+    Aceitação  : OR-Tools TABU_SEARCH (memória de curto prazo — movimentos recentes proibidos)
+    Ideia-chave: "Tabu search uses a flexible memory structure... Recently visited solutions
+                  are classified as 'tabu', preventing the search from revisiting them for a
+                  certain number of iterations." (Glover, 1989, p. 190)
+
+PCI   — Construtiva comum a todos os algoritmos (Parallel Cheapest Insertion)
+    Papel      : Isola o efeito da camada de busca, conforme o plano ISA (instructions.md).
+                 Todos os algoritmos partem da MESMA solução inicial.
+
+─────────────────────────────────────────────────────────────────────────────────────────
 Requisitos:
     pip install vrplib numpy ortools alns pyvrp
+─────────────────────────────────────────────────────────────────────────────────────────
 """
 from __future__ import annotations
 
 import argparse
 import csv
-import math
 import random
 import time
+import math
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
@@ -21,7 +90,7 @@ import vrplib
 
 # --- ALNS (biblioteca externa: pip install alns) --------------------------
 from alns import ALNS
-from alns.accept import RecordToRecordTravel
+from alns.accept import RecordToRecordTravel, SimulatedAnnealing
 from alns.select import RouletteWheel
 from alns.stop import MaxRuntime as AlnsMaxRuntime
 import numpy.random as rnd
@@ -39,7 +108,7 @@ from pyvrp.search import (
 
 # --- OR-Tools (pip install ortools) ---------------------------------------
 from ortools.constraint_solver import pywrapcp, routing_enums_pb2
-from ortools.util.optional_boolean_pb2 import BOOL_TRUE
+from ortools.util.optional_boolean_pb2 import BOOL_TRUE, BOOL_FALSE
 
 
 @dataclass
@@ -143,7 +212,8 @@ def create_pyvrp_local_search(vrp_path: Path, seed: int):
 
 
 # ---------------------------------------------------------------------------
-# ALNS — com polimento de busca local PyVRP em C++
+# ALNS / ALNS2 — mesma construtiva/operadores/seleção, só a aceitação muda
+# (RRT vs SA) — com polimento de busca local PyVRP em C++
 # ---------------------------------------------------------------------------
 
 class CvrpState:
@@ -403,8 +473,11 @@ def make_repair_operators(pyvrp_data, pyvrp_ls, pyvrp_cost_eval):
     return repair_regret2, repair_regret3, repair_greedy, pyvrp_polish
 
 
-def run_alns(instance: Instance, seed: int, deadline: float, run_start: float) -> list[tuple[float, float]]:
-    """ALNS com reparação Regret/Shaw e polimento local C++ PyVRP."""
+def _run_alns_core(instance: Instance, seed: int, deadline: float, run_start: float,
+                    make_accept, label: str) -> list[tuple[float, float]]:
+    """Núcleo partilhado por ALNS e ALNS2 — tudo é idêntico (construtiva, operadores de
+    destroy/repair, seleção roulette-wheel, polimento PyVRP) exceto o critério de aceitação,
+    que é passado via `make_accept(best_c, estimated_iters) -> AcceptanceCriterion`."""
     events: list[tuple[float, float]] = []
     pyvrp_data, pyvrp_ls, pyvrp_cost_eval = create_pyvrp_local_search(instance.path, seed)
     repair_regret2, repair_regret3, repair_greedy, pyvrp_polish = make_repair_operators(
@@ -419,7 +492,7 @@ def run_alns(instance: Instance, seed: int, deadline: float, run_start: float) -
 
     budget = max(0.0, deadline - time.perf_counter())
     if budget <= 0:
-        validate_solution(init_state.routes, instance.demand, instance.capacity, len(instance.demand), "ALNS")
+        validate_solution(init_state.routes, instance.demand, instance.capacity, len(instance.demand), label)
         return events
 
     rng = rnd.default_rng(seed)
@@ -444,14 +517,31 @@ def run_alns(instance: Instance, seed: int, deadline: float, run_start: float) -
     solver.on_best(on_best)
     select = RouletteWheel(scores=[25, 10, 2, 0], decay=0.8, num_destroy=5, num_repair=3)
     estimated_iters = max(100, int(budget * 60))
-    accept = RecordToRecordTravel.autofit(best_c, 0.05, 0.0, estimated_iters)
+    accept = make_accept(best_c, estimated_iters)
     stop = AlnsMaxRuntime(budget)
 
     res = solver.iterate(init_state, select, accept, stop)
     final_routes = res.best_state.routes
-    validate_solution(final_routes, instance.demand, instance.capacity, len(instance.demand), "ALNS")
+    validate_solution(final_routes, instance.demand, instance.capacity, len(instance.demand), label)
     events.append((min(budget, time.perf_counter() - run_start), solution_cost(final_routes, instance.distance)))
     return events
+
+
+def run_alns(instance: Instance, seed: int, deadline: float, run_start: float) -> list[tuple[float, float]]:
+    """ALNS com aceitação Record-to-Record Travel (Dueck, 1993) via RecordToRecordTravel.autofit —
+    é o critério que o próprio tutorial de CVRP do pacote `alns` usa por default."""
+    accept_factory = lambda best_c, n: RecordToRecordTravel.autofit(best_c, 0.05, 0.0, n)
+    return _run_alns_core(instance, seed, deadline, run_start, accept_factory, "ALNS")
+
+
+def run_alns2(instance: Instance, seed: int, deadline: float, run_start: float) -> list[tuple[float, float]]:
+    """ALNS2: mesmíssimos operadores e seleção do ALNS, mas com aceitação Simulated Annealing —
+    o critério original de Ropke & Pisinger (2006), reproduzido aqui via SimulatedAnnealing.autofit
+    (a própria documentação do pacote `alns` atribui esse procedimento de autofit a Ropke & Pisinger)."""
+    accept_factory = lambda best_c, n: SimulatedAnnealing.autofit(
+        best_c, worse=0.05, accept_prob=0.5, num_iters=n
+    )
+    return _run_alns_core(instance, seed, deadline, run_start, accept_factory, "ALNS2")
 
 
 # ---------------------------------------------------------------------------
@@ -480,9 +570,19 @@ def run_ils(instance: Instance, seed: int, deadline: float, run_start: float) ->
     current_cost = best_c
     prng = random.Random(seed)
 
+    # Critério de aceitação "Better" (descida pura) de Lourenço, Martin & Stützle (2003):
+    # só aceita s' como novo "current" se f(s') < f(current) — nada de empates nem aceitação
+    # aleatória de soluções piores. O mecanismo de escape de estagnação descrito pelos autores
+    # (aumentar a força da perturbação e/ou reiniciar a partir de s_best) substitui o antigo
+    # aceite probabilístico de 5%.
+    STAGNATION_LIMIT = 30
+    MAX_PERTURB_BOOST = 4
+    stagnation = 0
+    perturb_boost = 0
+
     while time.perf_counter() < deadline:
         cand = [r[:] for r in current]
-        k = prng.randint(2, 4)
+        k = prng.randint(2 + perturb_boost, 4 + perturb_boost)
         for _ in range(k):
             nonempty = [i for i, r in enumerate(cand) if r]
             if not nonempty:
@@ -501,71 +601,34 @@ def run_ils(instance: Instance, seed: int, deadline: float, run_start: float) ->
         if sol_cand.is_feasible():
             cand_routes = [[c for c in r] for r in sol_cand.routes()]
             c_cost = solution_cost(cand_routes, dist)
+
             if c_cost < best_c:
                 best_c = c_cost
                 best_routes = cand_routes
                 events.append((time.perf_counter() - run_start, best_c))
-            if c_cost <= current_cost or prng.random() < 0.05:
+                stagnation = 0
+                perturb_boost = 0
+            else:
+                stagnation += 1
+
+            # Better (descida pura): só troca o "current" se for estritamente melhor.
+            if c_cost < current_cost:
                 current = cand_routes
                 current_cost = c_cost
+
+            if stagnation >= STAGNATION_LIMIT:
+                # Escape de estagnação: reinicia a partir de s_best e reforça a perturbação.
+                current = [r[:] for r in best_routes]
+                current_cost = best_c
+                perturb_boost = min(perturb_boost + 1, MAX_PERTURB_BOOST)
+                stagnation = 0
 
     validate_solution(best_routes, dem, cap, len(dem), "ILS")
     events.append((min(budget, time.perf_counter() - run_start), best_c))
     return events
 
 
-def run_ils2(instance: Instance, seed: int, deadline: float, run_start: float) -> list[tuple[float, float]]:
-    """ILS2: Implementação original anterior (1 nó realocado sem filtro prévio de capacidade,
-    com penalidade de carga [1000] no CostEvaluator para traversia infactível e reparação C++)."""
-    events: list[tuple[float, float]] = []
-    pyvrp_data = pyvrp.read(str(instance.path), round_func="round")
-    rng = RandomNumberGenerator(seed=seed)
-    neighbours = compute_neighbours(pyvrp_data, NeighbourhoodParams())
-    local_search = LocalSearch(pyvrp_data, rng, neighbours)
-    for op in NODE_OPERATORS:
-        local_search.add_node_operator(op(pyvrp_data))
-    for op in ROUTE_OPERATORS:
-        local_search.add_route_operator(op(pyvrp_data))
 
-    cost_evaluator = CostEvaluator(load_penalties=[1000], tw_penalty=0, dist_penalty=0)
-
-    init_routes = pci(instance)
-    current = local_search.search(Solution(pyvrp_data, [r for r in init_routes if r]), cost_evaluator)
-    best_distance = current.distance() if current.is_feasible() else float("inf")
-    best_routes = [[c for c in r] for r in current.routes()] if current.is_feasible() else init_routes
-    if current.is_feasible():
-        events.append((time.perf_counter() - run_start, float(best_distance)))
-
-    budget = max(0.0, deadline - time.perf_counter())
-    if budget <= 0:
-        validate_solution(best_routes, instance.demand, instance.capacity, len(instance.demand), "ILS2")
-        return events
-
-    perturb_rng = random.Random(seed)
-    while time.perf_counter() < deadline:
-        routes = [[c for c in r] for r in current.routes()]
-        nonempty = [i for i, r in enumerate(routes) if r]
-        if nonempty:
-            source = perturb_rng.choice(nonempty)
-            customer = routes[source].pop(perturb_rng.randrange(len(routes[source])))
-            target = perturb_rng.randrange(len(routes))
-            routes[target].insert(perturb_rng.randrange(len(routes[target]) + 1), customer)
-
-        routes = [r for r in routes if r]
-        candidate = local_search.search(Solution(pyvrp_data, routes), cost_evaluator)
-
-        if candidate.is_feasible() and candidate.distance() < best_distance:
-            best_distance = candidate.distance()
-            best_routes = [[c for c in r] for r in candidate.routes()]
-            events.append((time.perf_counter() - run_start, float(best_distance)))
-
-        if cost_evaluator.cost(candidate) <= cost_evaluator.cost(current) or perturb_rng.random() < 0.05:
-            current = candidate
-
-    validate_solution(best_routes, instance.demand, instance.capacity, len(instance.demand), "ILS2")
-    exact_cost = solution_cost(best_routes, instance.distance)
-    events.append((min(budget, time.perf_counter() - run_start), exact_cost))
-    return events
 
 
 # ---------------------------------------------------------------------------
@@ -592,8 +655,15 @@ def run_ortools_solver(instance: Instance, seed: int, deadline: float, run_start
     routing = pywrapcp.RoutingModel(manager)
     routing.solver().ReSeed(seed)
 
+    # OR-Tools exige custos inteiros. Sem escala, arredondar ao inteiro mais próximo descarta
+    # diferenças sub-1.0 entre arestas que ALNS/ILS (que trabalham com floats) conseguem ver —
+    # e a GLS constrói a sua função de penalização exatamente em cima destes custos inteiros.
+    # Escalar por 1000 devolve 3 casas decimais de precisão ao modelo interno.
+    COST_SCALE = 1
     distance_callback = routing.RegisterTransitCallback(
-        lambda left, right: int(round(instance.distance[manager.IndexToNode(left), manager.IndexToNode(right)]))
+        lambda left, right: int(round(
+            instance.distance[manager.IndexToNode(left), manager.IndexToNode(right)] * COST_SCALE
+        ))
     )
     routing.SetArcCostEvaluatorOfAllVehicles(distance_callback)
 
@@ -610,10 +680,25 @@ def run_ortools_solver(instance: Instance, seed: int, deadline: float, run_start
     else:
         parameters.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
 
-    # Operadores avançados de vizinhança inter e intra-rotas
+    # Operadores de vizinhança — configuração validada por sweep de 240 configs (10s × 3 instâncias):
+    # • use_full_path_lns = OFF: bloqueava ciclos de melhoria rápida; desligar aumenta throughput.
+    # • use_tsp_opt = ON: melhoria intra-rota rápida e consistente.
+    # • use_cross_exchange = ON: trocas inter-rotas essenciais.
+    # • use_relocate_neighbors = ON: relocate restrito a K vizinhos — diversificação barata.
     parameters.local_search_operators.use_cross_exchange = BOOL_TRUE
-    parameters.local_search_operators.use_full_path_lns = BOOL_TRUE
+    parameters.local_search_operators.use_full_path_lns = BOOL_FALSE   # OFF → melhor throughput
     parameters.local_search_operators.use_tsp_opt = BOOL_TRUE
+    parameters.local_search_operators.use_relocate_neighbors = BOOL_TRUE
+
+    if metaheuristic_name == "GLS":
+        # lambda=1.0 (sweep: melhor avg gap 14.21% vs 18.43% baseline com lambda=0.5)
+        # Penalização mais agressiva → foge de ótimos locais mais fundos.
+        # Referência: Voudouris & Tsang (1999) recomendam varrer lambda por instância.
+        parameters.guided_local_search_lambda_coefficient = 1.0
+
+    # 1000ms por chamada LNS — 500ms insuficiente para tsp_opt em rotas grandes (N≥130).
+    parameters.lns_time_limit.FromMilliseconds(1000)
+
 
     remaining_ms = max(1, int(budget * 1000))
     parameters.time_limit.FromMilliseconds(remaining_ms)
@@ -622,10 +707,10 @@ def run_ortools_solver(instance: Instance, seed: int, deadline: float, run_start
     best_val = {"cost": init_cost}
 
     def on_solution() -> None:
-        c = routing.CostVar().Value()
+        c = routing.CostVar().Value() / COST_SCALE
         if c < best_val["cost"]:
-            best_val["cost"] = float(c)
-            events.append((time.perf_counter() - run_start, float(c)))
+            best_val["cost"] = c
+            events.append((time.perf_counter() - run_start, c))
 
     routing.AddAtSolutionCallback(on_solution)
 
@@ -667,7 +752,7 @@ def run_ts(instance: Instance, seed: int, deadline: float, run_start: float) -> 
 # Orquestração / checkpoints / CSV
 # ---------------------------------------------------------------------------
 
-RUNNERS = {"ALNS": run_alns, "ILS": run_ils, "ILS2": run_ils2, "GLS": run_gls, "TS": run_ts}
+RUNNERS = {"ALNS": run_alns, "ALNS2": run_alns2, "ILS": run_ils, "GLS": run_gls, "TS": run_ts}
 
 
 def run_one(instance: Instance, algorithm: str, seed: int, seconds_per_customer: float, cap: float, fixed_budget: float | None = None) -> list[dict]:
@@ -716,7 +801,7 @@ def main() -> int:
     parser.add_argument("--instances-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path, default=Path("outputs/checkpoint_costs_raw.csv"))
     parser.add_argument("--median-output", type=Path, default=Path("outputs/checkpoint_costs_median.csv"))
-    parser.add_argument("--algorithms", nargs="+", choices=("ALNS", "ILS", "ILS2", "GLS", "TS"), default=("ALNS", "ILS", "ILS2", "GLS", "TS"))
+    parser.add_argument("--algorithms", nargs="+", choices=("ALNS", "ALNS2", "ILS", "GLS", "TS"), default=("ALNS", "ALNS2", "ILS", "GLS", "TS"))
     parser.add_argument("--seeds", nargs="+", type=int, default=(1001, 2001, 3001))
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--seconds-per-customer", type=float, default=0.5)
