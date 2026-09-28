@@ -9,4 +9,4 @@ vrplib>=1.3.0
 # Solvers & Metaheuristics
 ortools>=9.8.0
 alns==7.0.0
-pyvrp>=0.10.0
+pyvrp==0.11.3
