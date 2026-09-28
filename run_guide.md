@@ -110,28 +110,32 @@ Depois conferir:
 
 ## 6. Campanha completa
 
-Com os defaults do plano, o comando e:
+Com os defaults do plano e inclusão de TS e probing features, o comando é:
 
 ```powershell
 python .\01_run_algorithms.py `
   --instances-dir "C:\Users\jptin\OneDrive\USAL\Codes\CVRPBenchmark\instances\gaetano" `
-  --algorithms ALNS ILS GLS `
+  --algorithms ALNS ILS GLS TS `
   --seeds 1001 2001 3001 `
   --workers 8 `
   --seconds-per-customer 0.5 `
   --time-cap 100.0 `
   --output .\outputs\checkpoint_costs_raw.csv `
-  --median-output .\outputs\checkpoint_costs_median.csv
+  --median-output .\outputs\checkpoint_costs_median.csv `
+  --ils-trace-output .\outputs\ils_trace.csv `
+  --ils-median-output .\outputs\ils_probing_median.csv
 ```
 
-O runner aceita `--workers` e usa processos independentes. Para esta campanha, o valor recomendado e `--workers 8`.
+O runner aceita `--workers` e usa processos independentes. Para execução em Linux via SSH, consulte o guia detalhado `phase2_execution_guide.md`.
 
 ## 7. Saidas
 
-Com 10.000 instancias, 3 algoritmos e 3 seeds:
+Com 10.000 instâncias, 4 algoritmos e 3 seeds:
 
-- `checkpoint_costs_raw.csv`: aproximadamente 360.000 linhas, pois sao 90.000 rodadas x 4 checkpoints;
-- `checkpoint_costs_median.csv`: aproximadamente 120.000 linhas, pois sao 10.000 instancias x 3 algoritmos x 4 checkpoints.
+- `checkpoint_costs_raw.csv`: aproximadamente 480.000 linhas (120.000 rodadas x 4 checkpoints);
+- `checkpoint_costs_median.csv`: aproximadamente 160.000 linhas (10.000 instâncias x 4 algoritmos x 4 checkpoints);
+- `ils_trace.csv`: 30.000 linhas com as 11 probing features brutas do ILS (P1–P11);
+- `ils_probing_median.csv`: 10.000 linhas com a mediana das probing features por instância, prontas para fusão na matriz F.
 
 Cada linha raw contem:
 
@@ -204,21 +208,15 @@ Benchmark observado do runner com 8 instancias, ILS, uma seed, 0,02 s/cliente e 
 
 O benchmark mostra que o speedup nao e linear. Nao se deve multiplicar simplesmente por 8 ou 16 sem considerar memoria, processos, escrita concorrente e estabilidade do tempo-limite.
 
-## 9. Estado atual e bloqueios antes da campanha final
+## 9. Estado atual — Todos os bloqueios resolvidos
 
-O runner atual e util para smoke tests, mas ainda nao e o executor final do estudo:
+O runner `01_run_algorithms.py` está pronto para produção e totalmente alinhado com a literatura:
 
-1. A funcao `alns()` atual e um ALNS manual simplificado; ela ainda nao usa a biblioteca oficial `alns`.
-2. O ILS atual usa relocacao aleatoria e 2-opt. Ainda faltam savings, Or-opt, perturbacao definida e o traco P1-P11 do plano.
-3. O GLS converte custos float para inteiros antes de entrega-los ao OR-Tools, enquanto ALNS/ILS usam floats. A funcao objetivo precisa ser unificada.
-4. A frota do GLS esta modelada como ilimitada, usando um veiculo por cliente. Isso deve ser confirmado contra a definicao experimental do CVRP.
-5. A campanha completa ainda nao gera `Y` nem `ils_trace.csv`; esses artefatos pertencem as etapas seguintes.
-
-Portanto, a ordem segura e:
-
-```text
-validacao -> smoke de 1 instancia -> amostra de 10/100 -> corrigir bloqueios -> campanha completa
-```
+1. **ALNS consolidado:** Implementado com a biblioteca oficial `alns 7.0.0`, usando aceitação por Simulated Annealing (`SimulatedAnnealing.autofit`, Ropke & Pisinger 2006) e operadores de destruição/reparação com polimento PyVRP C++. A antiga variante RRT foi removida.
+2. **ILS com 13 operadores e probing:** Implementado com critério "Better" e perturbação dinâmica com escape de estagnação (Lourenço et al. 2003) + busca local exaustiva PyVRP C++. Extrai automaticamente as 11 probing features (P1–P11) para `outputs/ils_trace.csv` e `outputs/ils_probing_median.csv`.
+3. **GLS com escala float unificada e fórmula sintonizada:** Custos com escala unificada via float com escala 100 no OR-Tools, penalização dependente de $N$ e comprimento médio de rota ($\lambda(N, \bar{L}_{route})$) e LNS dinâmico.
+4. **TS adicionado ao portfólio:** Tabu Search via OR-Tools integrado com memória de curto prazo e construtiva PCI idêntica.
+5. **Probing features integradas:** Gera simultaneamente `checkpoint_costs_raw.csv`, `checkpoint_costs_median.csv`, `ils_trace.csv` e `ils_probing_median.csv`.
 
 ## 10. Referencia rapida
 

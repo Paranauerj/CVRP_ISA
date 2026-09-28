@@ -27,13 +27,30 @@ Este plano é uma especificação técnica para um agente de codificação **esc
 
 ## 2. Algoritmos a comparar (Fase 2, mas executados agora para gerar Y e as probing features)
 
-Três metaheurísticas, **todas com a mesma heurística construtiva inicial: PCI (Parallel Cheapest Insertion)**:
+Metaheurísticas avaliadas no portfólio, **todas com a mesma heurística construtiva inicial: PCI (Parallel Cheapest Insertion)**:
 
-1. **ALNS** (Adaptive Large Neighborhood Search)
-2. **ILS** (Iterated Local Search — savings/2-opt/Or-opt como base, com critério de aceitação por perturbação)
-3. **GLS** (Guided Local Search, via OR-Tools)
+1. **ALNS** (Adaptive Large Neighborhood Search):
+   - Versão canónica com critério de aceitação por **Simulated Annealing** (Ropke & Pisinger, 2006), parametrizado via `SimulatedAnnealing.autofit(worse=0.05, accept_prob=0.5)` e biblioteca `alns 7.0.0`.
+   - Operadores de destruição: Shaw, Worst, Random, Route, String-SISR (Christiaens & Vanden Berghe, 2020).
+   - Operadores de reparação: Regret-2, Regret-3, Greedy.
+   - Polimento de busca local em C++ via PyVRP (Vidal, 2022).
+   - *Nota:* A antiga variante experimental baseada em Record-to-Record Travel (RRT) foi descontinuada/removida, consolidando o ALNS canónico com Simulated Annealing como o padrão único.
 
-Fixar a construtiva isola o efeito da camada de busca local/metaheurística na comparação — a diferença de desempenho entre os três não pode ser atribuída à heurística de construção, porque ela é idêntica nos três.
+2. **ILS** (Iterated Local Search):
+   - Critério de aceitação "Better" (descida pura) + perturbação dinâmica com escape de estagnação (Lourenço, Martin & Stützle, 2003).
+   - Camada de busca local exaustiva em C++ via PyVRP cobrindo 13 operadores de nó e rota (Vidal, 2022).
+   - Instrumentado internamente para extração automática das 11 probing features (P1–P11).
+
+3. **GLS** (Guided Local Search, via OR-Tools):
+   - Penalização adaptativa de arcos com coeficiente dependente de $N$ e do comprimento médio de rota: $\lambda(N, \bar{L}_{route}) = \text{clamp}(0.45, 1.25, 0.25 + 0.005 N + 0.025 \bar{L}_{route})$.
+   - LNS dinâmico: $\text{LNS}(N, \bar{L}_{route}) = \text{clamp}(60, 250, \text{int}(40 + 0.8 N + 8 \bar{L}_{route}))\text{ ms}$.
+   - Operadores ativos: `use_cross_exchange=True`, `use_tsp_opt=True`, `use_relocate_neighbors=True`, `use_full_path_lns=False`.
+
+4. **TS** (Tabu Search, via OR-Tools):
+   - Metaheurística baseada em memória explícita de curto prazo (Glover, 1989), proibindo arcos recentemente modificados para forçar diversificação contínua.
+   - Fornece complementaridade ao portfólio no espaço de instâncias (vencedor em instâncias de alta densidade e rotas curtas).
+
+Fixar a construtiva PCI isola o efeito da camada de busca local/metaheurística na comparação — a diferença de desempenho entre os algoritmos não pode ser atribuída à heurística de construção, porque ela é idêntica em todos.
 
 ### 2.1 Orçamento de tempo
 
@@ -44,17 +61,20 @@ $$T(N) = \min(0.5 \times N,\ \text{cap})$$
 
 ### 2.2 Execução e checkpoints
 
-Para cada instância × cada um dos 3 algoritmos:
+Para cada instância × cada algoritmo do portfólio:
 - Rodar **3 vezes** com seeds diferentes, até o tempo $T(N)$.
-- Durante cada rodada, capturar o **custo da melhor solução incumbente** nos checkpoints de **25%, 50%, 75% e 100%** de $T(N)$ (ex.: via callback/log de solução incumbente — necessário para os três algoritmos, incluindo o GLS do OR-Tools).
+- Durante cada rodada, capturar o **custo da melhor solução incumbente** nos checkpoints de **25%, 50%, 75% e 100%** de $T(N)$ (via registrador temporal / callback de incumbente).
 - Ao final das 3 rodadas, calcular a **mediana** do custo incumbente em cada checkpoint, por instância e por algoritmo.
 
-**Output esperado desta etapa:** uma tabela/arquivo com colunas:
-`instancia_id, algoritmo, checkpoint (25/50/75/100), custo_mediano_3_rodadas`
+**Output esperado desta etapa:**
+- `outputs/checkpoint_costs_raw.csv`: `instancia_id, algoritmo, seed, checkpoint, elapsed_target_seconds, cost`
+- `outputs/checkpoint_costs_median.csv`: `instancia_id, algoritmo, checkpoint, cost_median_3_seeds, n_seeds`
 
 ### 2.3 Probing features (P1–P11)
 
-Extraídas a partir do **traço de execução do ILS** (nº de passos de melhora, comprimento no mínimo local, melhoria por passo etc. — ver Seção 4). O ILS foi escolhido por ser o algoritmo mais simples de instrumentar internamente (o GLS via OR-Tools não expõe esse traço facilmente).
+Extraídas diretamente durante a execução do **ILS** (nº de passos de melhora, quartis de comprimento de aresta, comprimentos de rota, interseções no plano, melhoria por passo, passos até o mínimo local e persistência de arestas — ver Seção 4). O script `01_run_algorithms.py` exporta simultaneamente:
+- `outputs/ils_trace.csv`: features brutas por rodada (instância e seed).
+- `outputs/ils_probing_median.csv`: features agregadas pela mediana das 3 seeds por instância, prontas para fusão na matriz $F$.
 
 ---
 
@@ -213,14 +233,14 @@ Para permitir reaplicar o espaço já construído a instâncias externas sem ref
 
 | Parâmetro | Valor |
 |---|---|
-| Algoritmos comparados | ALNS, ILS, GLS |
-| Heurística construtiva (fixa) | PCI |
+| Algoritmos comparados | ALNS (canónico SA Ropke & Pisinger), ILS, GLS (sintonizado), TS (Tabu Search) |
+| Heurística construtiva (fixa) | PCI (Parallel Cheapest Insertion) |
 | Orçamento de tempo | $T(N) = \min(0.5N,\ 100s)$ |
 | Rodadas por instância/algoritmo | 3 (mediana) |
 | Checkpoints | 25%, 50%, 75%, 100% de T |
 | Nº de instâncias | 10.000 (N entre 30 e 200) |
-| Fonte de Y | Gap vs. BKS, checkpoint 100%, 3 colunas (uma por algoritmo) |
-| Fonte das probing features | Traço de execução do ILS |
+| Fonte de Y | Gap vs. BKS, checkpoint 100% (matriz com colunas por algoritmo) |
+| Fonte das probing features | Traço de execução do ILS (`outputs/ils_trace.csv` e `outputs/ils_probing_median.csv`) |
 | ε | **Não fixado aqui — decisão manual do usuário após revisar a distribuição de Y (Seção 5)** |
 | φmax / φbnd / φnrm | False / False / False |
 | K (SIFTED) | 10, fixo |
