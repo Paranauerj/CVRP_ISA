@@ -58,7 +58,7 @@ source venv/bin/activate
 
 # Instalar dependências essenciais
 pip install --upgrade pip
-pip install numpy scipy vrplib ortools alns==7.0.0 pyvrp
+pip install -r requirements.txt
 ```
 
 Verifique se as bibliotecas carregam sem erros:
@@ -78,7 +78,7 @@ cd ~/cvrp_isa
 source venv/bin/activate
 
 nohup python3 01_run_algorithms.py \
-  --instances-dir "/caminho/para/instancias/gaetano" \
+  --instances-dir "../../joao/instances/gaetano" \
   --algorithms ALNS ILS GLS TS \
   --seeds 1001 2001 3001 \
   --workers 8 \
