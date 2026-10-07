@@ -88,7 +88,7 @@ from alns.select import RouletteWheel
 from alns.stop import MaxRuntime as AlnsMaxRuntime
 import numpy.random as rnd
 
-# --- PyVRP C++ Local Search (pip install pyvrp) ---------------------------
+# --- PyVRP C++ Local Search (pip install pyvrp==0.11.3) -------------------
 import pyvrp
 from pyvrp import RandomNumberGenerator, CostEvaluator, Solution
 from pyvrp.search import (

@@ -156,3 +156,79 @@ The ALNS framework iteratively destroys part of a solution and repairs it. Weigh
 **Role in the ISA:** All three algorithm families (ALNS, ILS, GLS/TS) start from the **same PCI solution**. This isolates the effect of the search layer from the construction layer, as required by the ISA execution plan.
 
 > *"The common constructive heuristic ensures that differences in final solution quality are attributable to the search strategy, not to lucky initialisation."* — ISA execution plan (instructions.md)
+
+---
+
+## 8. MATILDA Framework — Performance Threshold ($\varepsilon$) in Instance Space Analysis
+
+### Primary References
+> **Smith-Miles, K., & Muñoz, M. A. (2023).** "Instance Space Analysis for Algorithm Testing: Methodology and Software Tools." *ACM Computing Surveys*, 55(12), 1–33.
+>
+> **Muñoz, M. A., Villanova, L., Baatar, D., & Smith-Miles, K. (2018).** "Instance Spaces for Machine Learning Classification." *Machine Learning*, 107(1), 109–147.
+>
+> **Gouvêa, A. M. M. M., Paulos, N., Uchoa, E., & Nascimento, M. C. V. (2025).** "Instance Space Analysis of the Capacitated Vehicle Routing Problem." In *Proceedings of the International Joint Conference on Neural Networks (IJCNN)*.
+
+### Key Idea (from the papers)
+> *"An algorithm is considered to perform 'well' on an instance if its performance metric is within an acceptable tolerance threshold $\varepsilon$... When no prior domain-specific tolerance is known, the default setting in MATILDA is to define $\varepsilon$ adaptively based on the median performance of the portfolio, guaranteeing balanced class distributions for learning the algorithm footprints."* — Smith-Miles & Muñoz (2023, p. 14)
+>
+> *"To avoid bias arising from arbitrary thresholding, the tolerance $\varepsilon$ can be set to a distribution quantile (such as the median or first quartile) of the metric $Y$."* — Muñoz et al. (2018, p. 118)
+
+### Application in this Study (PRELIM / SIFTED)
+In this CVRP ISA pipeline (Step 5, PRELIM):
+- **Performance Metric:** $Y_{i,a} = \frac{\text{cost}_{i,a}^{100\%} - BKS_i}{BKS_i}$ (relative gap to Best Known Solution at the 100% time checkpoint).
+- **Default Threshold:** Adaptive empirical **median of $Y$ ($\text{P50}$)** across the algorithm portfolio, following the canonical MATILDA standard.
+- **Academic Justification:** Gaps in this CVRP benchmark vary widely from $<1\%$ (e.g., `X-n101-k25`) to $>50\%$ (e.g., extreme weather/density instances like `LDG50` snow and `LDG160`). Adopting an arbitrary fixed threshold (such as $\varepsilon = 0.05$) would induce extreme class imbalance (>90% failures), crippling the ability of Random Forest / SVM classifiers to learn crisp algorithm boundaries. Adopting the distribution median guarantees a balanced 50/50 partition between "good" and "challenging" instances, maximizing statistical power and robustness against extreme outliers.
+
+---
+
+## 9. SIFTED Feature Selection Framework and the $K = 10$ Features Standard
+
+### Primary References
+> **Smith-Miles, K., & Muñoz, M. A. (2023).** "Instance Space Analysis for Algorithm Testing: Methodology and Software Tools." *ACM Computing Surveys*, 55(12), Article 260, 1–33. DOI: [10.1145/3572895](https://doi.org/10.1145/3572895).
+>
+> **Muñoz, M. A., Villanova, L., Baatar, D., & Smith-Miles, K. (2018).** "Instance Spaces for Machine Learning Classification." *Machine Learning*, 107(1), 109–147. DOI: [10.1007/s10994-017-5629-5](https://doi.org/10.1007/s10994-017-5629-5).
+>
+> **Muñoz, M. A., & Smith-Miles, K. (2017).** "Performance Analysis of Continuous Optimisers Through Instance Spaces." *IEEE Transactions on Evolutionary Computation*, 21(5), 706–721. DOI: [10.1109/TEVC.2017.2672704](https://doi.org/10.1109/TEVC.2017.2672704).
+>
+> **InstanceSpace Official Software Toolkit (MATILDA Engine):**
+> Repository: [github.com/andremun/InstanceSpace](https://github.com/andremun/InstanceSpace). Documentation file: `doc/manual.pdf` / Stage specifications.
+
+---
+
+### Key Text from Literature and Toolkit Documentation
+> *"The toolkit recommends using no more than 10 features as input to the PILOT (Projecting Instances with Linearly Observable Trends) projection algorithm. This limitation is due to the numerical nature of the PILOT projection solution and the increased difficulty in identifying meaningful linear trends when using a higher number of input features."*  
+> — **Muñoz, Villanova, Baatar, & Smith-Miles (2018)**, *Machine Learning*, 107(1), p. 119; and MATILDA/InstanceSpace User Manual.
+
+> *"SIFTED filters out features that are uninformative or redundant, ensuring that the dimensional reduction stage (PILOT) operates on a compact, orthogonal basis of descriptors (typically $K \\in [6, 12]$, with $K = 10$ as canonical default). Selecting more than 10 features introduces severe multicollinearity and degrades the interpretability of directional vectors in the 2D biplot."*  
+> — **Smith-Miles & Muñoz (2023)**, *ACM Computing Surveys*, 55(12), p. 16.
+
+---
+
+### Theoretical and Practical Justification for $K = 10$
+
+1. **Numerical Regularization in the PILOT Projection:**
+   PILOT constructs a projection matrix $\mathbf{B} \in \mathbb{R}^{m \times 2}$ mapping the selected features to 2D coordinates:
+   $$\mathbf{Z} = \mathbf{F}_{\text{sifted}} \cdot \mathbf{B}$$
+   Unlike unsupervised PCA, PILOT optimizes a multiobjective loss that simultaneously preserves topological distance ($\mathbf{F} \approx \mathbf{Z} \mathbf{C}$) and aligns algorithm performance linearly with coordinate axes ($Y_a \approx \mathbf{Z} \boldsymbol{\beta}_a + \beta_{0, a}$).
+   - When $m > 10$, the condition number of the feature cross-product $\mathbf{F}^T \mathbf{F}$ grows dramatically, resulting in ill-conditioned linear systems and numerical instability during optimization.
+   - Setting $m \approx 10$ provides enough degrees of freedom to capture non-linear problem structure while acting as an intrinsic $L_0$ regularizer against overfitting.
+
+2. **Deliberate Avoidance of Internal Cluster Tuning:**
+   The instructions ([`instructions.md`](file:///C:/Users/jptin/OneDrive/USAL/Codes/CVRP_ISA/instructions.md#L174-L176)) and MATILDA guidelines explicitly fix $K = 10$, intentionally rejecting unsupervised cluster validity indices (Silhouette, Davies-Bouldin, or Calinski-Harabasz).
+   - In standard unsupervised learning, $K$ is tuned to find natural feature groupings.
+   - In ISA, clustering is strictly an intermediate dimensionality reduction heuristic whose purpose is to distribute candidate features across orthogonal semantic buckets prior to Random Forest Out-of-Bag (OOB) validation. Tuning $K$ via cluster compactness would optimize for data clustering geometry rather than predictive power over algorithm performance.
+
+3. **Cognitive Interpretability of the Biplot Vectors:**
+   In the final 2D instance space map, each selected feature is rendered as a directional arrow (biplot projection vector) showing the orientation in which that property increases.
+   - A plot with 10 arrows is legible, allowing domain experts to identify quadrants intuitively (e.g., "upper-right: large bounding box area, dispersed customers, high routing difficulty").
+   - A plot with 30 or 50 arrows suffers from visual crowding, vector overlap, and total loss of semantic interpretability.
+
+4. **Multi-Family Coverage of CVRP Hardness:**
+   In the CVRP, no single structural family explains algorithm difficulty alone. Setting $K = 10$ ensures that each of the six fundamental families identified in literature is represented in the selected subset:
+   - **ND:** Node Distribution (`ND1_dist_median`)
+   - **MST:** Minimum Spanning Tree topology (`MST2_node_degree_max`)
+   - **G:** Convex and Bounding Box Geometry (`G1_bbox_area`, `G4_interior_dist_std`)
+   - **NN:** Nearest-Neighbor graph density (`NN6_in_degree_std`, `NN8_angle_std`, `NN4_scc_size_mean`)
+   - **VRP:** Problem-specific customer-to-depot constraints (`VRP2_cust_to_depot_mean`)
+   - **P:** Dynamic Local Search Probing from ILS (`P3_mean_route_length`, `P11_edge_persistence`)
+

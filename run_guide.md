@@ -218,9 +218,98 @@ O runner `01_run_algorithms.py` está pronto para produção e totalmente alinha
 4. **TS adicionado ao portfólio:** Tabu Search via OR-Tools integrado com memória de curto prazo e construtiva PCI idêntica.
 5. **Probing features integradas:** Gera simultaneamente `checkpoint_costs_raw.csv`, `checkpoint_costs_median.csv`, `ils_trace.csv` e `ils_probing_median.csv`.
 
-## 10. Referencia rapida
+## 10. Execucao das Etapas ISA (Pipeline de Ponta a Ponta)
 
-- Validacao: `00_validate_inputs.py`
-- Runner atual: `01_run_algorithms.py`
-- Decisoes tecnicas: `isa_implementation_notes.md`
-- Plano original: `instructions.md` (nao editar durante esta etapa)
+Uma vez concluída a execução do benchmark (Etapa 1), as fases subsequentes de Instance Space Analysis são executadas sequencialmente:
+
+### Etapa 2 — Extracao da Matriz de Caracteristicas (F)
+Extrai 50 características estáticas estruturais (ND, MST, G, NN, VRP) e mescla as 13 colunas de probing dinâmico do ILS:
+```powershell
+python .\02_extract_features.py `
+  --instances-dir "C:\Users\jptin\OneDrive\USAL\Codes\CVRPBenchmark\instances\gaetano" `
+  --probing-file .\outputs\ils_probing_median.csv `
+  --workers 8 `
+  --output .\outputs\F.parquet `
+  --csv-output .\outputs\F.csv
+```
+
+### Etapa 3 — PRELIM (Matriz de Gaps Y e Ponto de Decisao de epsilon)
+Calcula os gaps relativos vs. BKS a 100% de tempo, avalia a distribuição empírica (P10 a P90) e aplica o critério mediano canônico do MATILDA:
+```powershell
+python .\03_prelim.py `
+  --instances-dir "C:\Users\jptin\OneDrive\USAL\Codes\CVRPBenchmark\instances\gaetano" `
+  --median-costs .\outputs\checkpoint_costs_median.csv `
+  --features .\outputs\F.parquet `
+  --output-y .\outputs\Y.parquet `
+  --csv-output .\outputs\Y.csv `
+  --epsilon auto
+```
+*Gera: `outputs/prelim_distribution.png`, `outputs/prelim_report.md` e `outputs/prelim_summary.json`.*
+
+### Etapa 4 — SIFTED (Selecao de K=10 Features)
+Aplica filtro de correlação de Pearson ($|r| \ge 0.5$), agrupa em $K=10$ clusters ortogonais e seleciona o subconjunto minimizando o erro Out-of-Bag (OOB) do Random Forest:
+```powershell
+python .\04_sifted.py `
+  --features .\outputs\F.parquet `
+  --performance .\outputs\Y.parquet `
+  --k-clusters 10 `
+  --output-parquet .\outputs\F_sifted.parquet `
+  --output-csv .\outputs\F_sifted.csv `
+  --output-features .\outputs\sifted_features.json
+```
+*Gera: `outputs/F_sifted.parquet`, `outputs/sifted_clusters.png` e `outputs/sifted_report.md`.*
+
+### Etapa 5 — PILOT (Projecao Linear Analitica e Rotacao Otimizada)
+Resolve a decomposição espectral generalizada em forma fechada ($\phi_{\text{num}} = \text{False}$), otimiza $N_{\text{try}} = 30$ rotações e gera a Equação 1 canônica:
+```powershell
+python .\05_pilot.py `
+  --sifted-features .\outputs\F_sifted.parquet `
+  --performance .\outputs\Y.parquet `
+  --n-try 30 `
+  --output-z .\outputs\Z_matrix.json `
+  --output-coords .\outputs\projected_coords.parquet `
+  --output-plot .\outputs\instance_space_pilot.png
+```
+*Gera: `outputs/Z_matrix.json`, `outputs/projected_coords.parquet`, `outputs/instance_space_pilot.png` e `outputs/pilot_report.md`.*
+
+### Etapa 6 — Overlay de Checkpoints e Migracao de Footprint (25%, 50%, 75%, 100%)
+Projeta os 4 checkpoints no espaço $(Z_1, Z_2)$ fixo, gerando mapas de Best Selection e curvas de migração de footprint para o artigo de AAS:
+```powershell
+python .\06_overlay_checkpoints.py `
+  --raw-costs .\outputs\checkpoint_costs_raw.csv `
+  --median-costs .\outputs\checkpoint_costs_median.csv `
+  --instances-dir "C:\Users\jptin\OneDrive\USAL\Codes\CVRPBenchmark\instances\gaetano" `
+  --coords .\outputs\projected_coords.parquet `
+  --z-matrix .\outputs\Z_matrix.json
+```
+*Gera: `checkpoint_overlays_algorithms.png`, `checkpoint_overlays_best_selection.png`, `checkpoint_evolution_summary.png` e `params_log.md`.*
+
+### Etapa 7 — Extensibilidade para Novos Datasets (ex.: Uchoa Set X)
+Projeta novas instâncias no mesmo mapa geométrico SEM refazer SIFTED nem PILOT e sem executar algoritmos adicionais:
+```powershell
+python .\07_project_new_instances.py `
+  --instances-dir "C:\caminho\para\novas_instancias" `
+  --z-matrix .\outputs\Z_matrix.json `
+  --ref-coords .\outputs\projected_coords.parquet `
+  --output-coords .\outputs\projected_new_instances.parquet `
+  --output-plot .\outputs\projected_new_instances_overlay.png
+```
+*Gera: `projected_new_instances.parquet`, `projected_new_instances_overlay.png` e `projected_new_instances_report.md`.*
+
+---
+
+## 11. Referencia Rapida de Scripts e Modulos
+
+| Script | Etapa | Descrição |
+|---|---|---|
+| `00_validate_inputs.py` | 1 | Validação 1:1 entre instâncias `.vrp` e soluções `.sol` |
+| `01_run_algorithms.py` | 2 | Solvers (ALNS, ILS, GLS, TS) com PCI e probing features $P_1-P_{11}$ |
+| `cvrp_features.py` | 2/4/10 | Módulo independente com as 50 funções estáticas de features CVRP |
+| `02_extract_features.py` | 4 | Extrai features estáticas e faz join com probing median $\to \mathbf{F}$ |
+| `03_prelim.py` | 5 | Computa matriz de gaps $\mathbf{Y}$ e análise de $\varepsilon$ (Ponto de parada 5a) |
+| `04_sifted.py` | 6 | Filtragem Pearson, clustering $K=10$ e seleção via Random Forest OOB $\to \mathbf{F}_{\text{sifted}}$ |
+| `05_pilot.py` | 7 | Projeção linear analítica fechada e rotação $N_{\text{try}}=30 \to \mathbf{Z}$ |
+| `06_overlay_checkpoints.py` | 8 | Sobreposição multi-checkpoint (25-100%) e evolução de Best Selection |
+| `07_project_new_instances.py` | 10 | Reaplicação do mapa fixado para datasets externos (ex.: Uchoa Set X) |
+| `literature_alignment.md` | — | Documentação com citações acadêmicas para $\varepsilon$, $K=10$ e operadores |
+| `params_log.md` | 9 | Log consolidado de todos os parâmetros para a seção de metodologia do paper |
