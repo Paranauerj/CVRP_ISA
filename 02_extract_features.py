@@ -74,6 +74,10 @@ def main() -> int:
     print(f"Features estáticas extraídas: {df_static.shape[1]} colunas para {len(df_static)} instâncias.")
 
     # Fusão com as 11 Probing Features (P1 a P11)
+    existing_p = [c for c in df_static.columns if c.startswith("P")]
+    if existing_p:
+        df_static = df_static.drop(columns=existing_p)
+
     if args.probing_file.exists():
         print(f"Carregando probing features de {args.probing_file}...")
         df_probing = pd.read_csv(args.probing_file).set_index("instancia_id")

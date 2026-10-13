@@ -43,8 +43,11 @@ if hasattr(sys.stdout, "reconfigure"):
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.patches import Polygon as MplPolygon
+from matplotlib.path import Path as MplPath
 import numpy as np
 import pandas as pd
+from scipy.spatial import ConvexHull
 
 
 # ---------------------------------------------------------------------------
@@ -232,14 +235,18 @@ def plot_best_selection_evolution(
     checkpoints: list[int],
     algorithms: list[str],
     output_png: Path,
+    show_polygons: bool = True,
 ) -> None:
     """
     Gera o mapa dinâmico de 'Best Selection' (Footprint Temporal do Vencedor) nos 4 checkpoints.
     Equivalente à Fig. 3 do Notice e à Fig. 4 do Gouvêa et al. (2025).
+    Se show_polygons=True, desenha os envoltórios convexos (Convex Hull) representando o Footprint contínuo.
+    Se show_polygons=False, exibe dispersão pura de pontos sem polígonos sobrepostos.
     """
     fig, axes = plt.subplots(1, len(checkpoints), figsize=(4.5 * len(checkpoints), 4.8), sharex=True, sharey=True)
-    fig.suptitle("Evolução Temporal do Melhor Algoritmo ('Best Selection') no Espaço Fixo (Z1, Z2)",
-                 fontsize=14, fontweight="bold")
+    title_suffix = "com Footprints Poligonais" if show_polygons else "(Dispersão Pura de Pontos)"
+    fig.suptitle(f"Evolução Temporal do Melhor Algoritmo ('Best Selection') {title_suffix}",
+                 fontsize=13, fontweight="bold")
 
     algo_palette = {
         "ALNS": "#1f77b4",  # Azul
@@ -256,6 +263,22 @@ def plot_best_selection_evolution(
             mask = (sub["best_algo"] == alg)
             if np.any(mask):
                 c_color = algo_palette.get(alg, "#9467bd")
+                pts = sub.loc[mask, ["Z1", "Z2"]].values
+                if show_polygons and len(pts) >= 3:
+                    try:
+                        hull = ConvexHull(pts)
+                        poly = MplPolygon(
+                            pts[hull.vertices],
+                            facecolor=c_color,
+                            edgecolor=c_color,
+                            alpha=0.18,
+                            linestyle="--",
+                            linewidth=1.5,
+                            zorder=2,
+                        )
+                        ax.add_patch(poly)
+                    except Exception:
+                        pass
                 ax.scatter(sub.loc[mask, "Z1"], sub.loc[mask, "Z2"],
                            color=c_color, label=f"{alg} ({mask.sum()} inst)",
                            s=120, edgecolor="black", zorder=3)
@@ -278,7 +301,7 @@ def plot_best_selection_evolution(
     output_png.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(output_png, dpi=300)
     plt.close()
-    print(f"[OK] Painel de 'Best Selection' salvo em: {output_png}")
+    print(f"[OK] Painel de 'Best Selection' ({'com polígonos' if show_polygons else 'sem polígonos'}) salvo em: {output_png}")
 
 
 def plot_summary_dashboard(
@@ -478,6 +501,119 @@ def generate_params_log(
     print(f"[OK] Log metodológico consolidado salvo em: {output_md}")
 
 
+def compute_footprint_metrics(
+    df_consolidated: pd.DataFrame,
+    checkpoints: list[int],
+    algorithms: list[str],
+    epsilon: float = 0.05,
+) -> pd.DataFrame:
+    """
+    Calcula as métricas de Footprint canônicas para Good e Best performance:
+      - Normalized Area (A): Área do polígono / Área do Convex Hull do espaço total.
+      - Density (D): Proporção de instâncias dentro do polígono normalizada pela densidade do espaço.
+      - Purity (P): Proporção de instâncias com desempenho alvo contidas no polígono.
+    Alinhado estritamente à Tabela 3 de Notice et al. (2025) e Seção 3.4 de Smith-Miles & Muñoz (2023).
+    """
+    df_unique = df_consolidated.drop_duplicates(subset=["instancia_id"]).copy()
+    Z_all = df_unique[["Z1", "Z2"]].values
+    n_total = len(Z_all)
+
+    if n_total >= 3:
+        try:
+            hull_space = ConvexHull(Z_all)
+            area_space = float(hull_space.volume)
+        except Exception:
+            area_space = 1.0
+    else:
+        area_space = 1.0
+    density_space = n_total / area_space if area_space > 0 else 1.0
+
+    records = []
+    for cp in checkpoints:
+        sub_cp = df_consolidated[df_consolidated["checkpoint"] == cp]
+        for alg in algorithms:
+            # 1. Good Performance
+            good_mask = sub_cp[f"{alg}_gap"] <= epsilon
+            Z_good = sub_cp.loc[good_mask, ["Z1", "Z2"]].values
+            good_ids = set(sub_cp.loc[good_mask, "instancia_id"])
+
+            if len(Z_good) >= 3:
+                try:
+                    hull_good = ConvexHull(Z_good)
+                    area_good = float(hull_good.volume)
+                    norm_area_good = area_good / area_space
+                    path_good = MplPath(Z_good[hull_good.vertices])
+                    inside_mask = path_good.contains_points(Z_all)
+                    n_inside_total = int(np.sum(inside_mask))
+                    inside_good = sum(
+                        1
+                        for _, row in df_unique.iterrows()
+                        if row["instancia_id"] in good_ids and path_good.contains_point((row["Z1"], row["Z2"]))
+                    )
+                    purity_good = inside_good / n_inside_total if n_inside_total > 0 else 1.0
+                    density_good = (n_inside_total / area_good) / density_space if area_good > 0 else 0.0
+                except Exception:
+                    norm_area_good = 0.0
+                    density_good = len(Z_good) / n_total
+                    purity_good = 1.0
+            elif len(Z_good) > 0:
+                norm_area_good = 0.0
+                density_good = len(Z_good) / n_total
+                purity_good = 1.0
+            else:
+                norm_area_good = 0.0
+                density_good = 0.0
+                purity_good = 0.0
+
+            # 2. Best Performance
+            best_mask = sub_cp["best_algo"] == alg
+            Z_best = sub_cp.loc[best_mask, ["Z1", "Z2"]].values
+            best_ids = set(sub_cp.loc[best_mask, "instancia_id"])
+
+            if len(Z_best) >= 3:
+                try:
+                    hull_best = ConvexHull(Z_best)
+                    area_best = float(hull_best.volume)
+                    norm_area_best = area_best / area_space
+                    path_best = MplPath(Z_best[hull_best.vertices])
+                    inside_mask = path_best.contains_points(Z_all)
+                    n_inside_total = int(np.sum(inside_mask))
+                    inside_best = sum(
+                        1
+                        for _, row in df_unique.iterrows()
+                        if row["instancia_id"] in best_ids and path_best.contains_point((row["Z1"], row["Z2"]))
+                    )
+                    purity_best = inside_best / n_inside_total if n_inside_total > 0 else 1.0
+                    density_best = (n_inside_total / area_best) / density_space if area_best > 0 else 0.0
+                except Exception:
+                    norm_area_best = 0.0
+                    density_best = len(Z_best) / n_total
+                    purity_best = 1.0
+            elif len(Z_best) > 0:
+                norm_area_best = 0.0
+                density_best = len(Z_best) / n_total
+                purity_best = 1.0
+            else:
+                norm_area_best = 0.0
+                density_best = 0.0
+                purity_best = 0.0
+
+            records.append({
+                "checkpoint": cp,
+                "algoritmo": alg,
+                "good_area": round(norm_area_good, 3),
+                "good_density": round(density_good, 3),
+                "good_purity": round(purity_good, 3),
+                "best_area": round(norm_area_best, 3),
+                "best_density": round(density_best, 3),
+                "best_purity": round(purity_best, 3),
+                "n_good": int(np.sum(good_mask)),
+                "n_best": int(np.sum(best_mask)),
+            })
+
+    return pd.DataFrame(records)
+
+
 # ---------------------------------------------------------------------------
 # CLI e Execução Principal
 # ---------------------------------------------------------------------------
@@ -538,7 +674,13 @@ def main() -> None:
         "--out-plot-best",
         type=Path,
         default=Path("checkpoint_overlays_best_selection.png"),
-        help="Gráfico de Best Selection por checkpoint. Padrão: checkpoint_overlays_best_selection.png",
+        help="Gráfico de Best Selection por checkpoint com polígonos de footprint. Padrão: checkpoint_overlays_best_selection.png",
+    )
+    parser.add_argument(
+        "--out-plot-best-points",
+        type=Path,
+        default=Path("checkpoint_overlays_best_selection_points.png"),
+        help="Gráfico de Best Selection por checkpoint sem polígonos (apenas dispersão). Padrão: checkpoint_overlays_best_selection_points.png",
     )
     parser.add_argument(
         "--out-plot-summary",
@@ -557,6 +699,18 @@ def main() -> None:
         type=Path,
         default=Path("params_log.md"),
         help="Checklist e log completo dos parâmetros metodológicos. Padrão: params_log.md",
+    )
+    parser.add_argument(
+        "--out-footprint-metrics",
+        type=Path,
+        default=Path("footprint_metrics.csv"),
+        help="Arquivo CSV para as métricas de Footprint (Area, Density, Purity). Padrão: footprint_metrics.csv",
+    )
+    parser.add_argument(
+        "--epsilon",
+        type=float,
+        default=0.05,
+        help="Tolerância de gap para Good Performance no Footprint (padrão: 0.05 = 5%)",
     )
 
     args = parser.parse_args()
@@ -617,6 +771,7 @@ def main() -> None:
     args.out_checkpoints_csv.parent.mkdir(parents=True, exist_ok=True)
     args.out_plot_algorithms.parent.mkdir(parents=True, exist_ok=True)
     args.out_plot_best.parent.mkdir(parents=True, exist_ok=True)
+    args.out_plot_best_points.parent.mkdir(parents=True, exist_ok=True)
     args.out_plot_summary.parent.mkdir(parents=True, exist_ok=True)
     args.out_params_log.parent.mkdir(parents=True, exist_ok=True)
     args.out_report_md.parent.mkdir(parents=True, exist_ok=True)
@@ -626,12 +781,24 @@ def main() -> None:
     print(f"\n[OK] Tabela consolidada de gaps salva em Parquet: {args.out_checkpoints_parquet}")
     print(f"[OK] Tabela consolidada de gaps salva em CSV    : {args.out_checkpoints_csv}")
 
-    # 6. Gerar Gráficos
+    # 6. Calcular Métricas de Footprint (Notice et al., 2025, Tabela 3 & Smith-Miles & Muñoz, 2023)
+    df_footprints = compute_footprint_metrics(
+        df_consolidated=df_consolidated,
+        checkpoints=checkpoints,
+        algorithms=algorithms,
+        epsilon=args.epsilon,
+    )
+    args.out_footprint_metrics.parent.mkdir(parents=True, exist_ok=True)
+    df_footprints.to_csv(args.out_footprint_metrics, index=False)
+    print(f"[OK] Métricas de Footprint salvas em CSV        : {args.out_footprint_metrics}")
+
+    # 7. Gerar Gráficos
     plot_algorithm_gap_overlays(df_consolidated, checkpoints, algorithms, args.out_plot_algorithms)
-    plot_best_selection_evolution(df_consolidated, checkpoints, algorithms, args.out_plot_best)
+    plot_best_selection_evolution(df_consolidated, checkpoints, algorithms, args.out_plot_best, show_polygons=True)
+    plot_best_selection_evolution(df_consolidated, checkpoints, algorithms, args.out_plot_best_points, show_polygons=False)
     plot_summary_dashboard(df_consolidated, checkpoints, algorithms, args.out_plot_summary)
 
-    # 7. Gerar params_log.md (Checklist de Entrega)
+    # 8. Gerar params_log.md (Checklist de Entrega)
     generate_params_log(
         output_md=args.out_params_log,
         algorithms=algorithms,
@@ -639,7 +806,7 @@ def main() -> None:
         n_instances=len(df_consolidated["instancia_id"].unique()),
     )
 
-    # 8. Gerar Relatório Técnico Markdown
+    # 9. Gerar Relatório Técnico Markdown
     md_report = f"""# Relatório de Overlay dos Checkpoints no Espaço Fixo de Instâncias (Etapa 8)
 
 ## 1. Contexto Científico e Conexão com AAS
@@ -669,20 +836,62 @@ O espaço linear de instâncias $(Z_1, Z_2)$ foi construído e fixado na Etapa 7
         md_report += f"- **Checkpoint {cp}%:** " + ", ".join([f"{alg}: {cnt} inst" for alg, cnt in counts.items()]) + "\n"
 
     md_report += f"""
-## 3. Principais Insights e Dinâmica Temporal
-1. **Convergência Rápida vs. Busca Abrangente:**
-   - Em fases iniciais ($25\\%$ de tempo), métodos baseados em perturbação local direta (como **ILS**) assumem a liderança em quase todas as instâncias devido à rápida descida por vizinhanças clássicas.
-   - À medida que o orçamento avança ($75\\%$ a $100\\%$), heurísticas com mecanismos sofisticados de destruição e reconstrução em larga escala (como **ALNS**) recuperam terreno em topologias altamente restritas ou com clima adverso (neve/neblina), atingindo soluções superiores.
-2. **Estabilidade Espacial das Fronteiras:**
-   - Instâncias no quadrante inferior-esquerdo (como `X-n101-k25` e `LDG80_none`) convergem precocemente para soluções quase ótimas, com pouca alteração relativa nos estágios finais.
-   - Instâncias no quadrante superior (como `LDG160_snow` e `LDG50_snow`) continuam obtendo reduções significativas de custo mesmo após $75\\%$ do tempo decorrido.
+## 3. Avaliação Quantitativa dos Footprints (Notice et al., 2025, Tabela 3 & Smith-Miles & Muñoz, 2023)
 
-## 4. Artefatos de Visualização Produzidos
-- `checkpoint_overlays_algorithms.png`: Grade comparativa de todos os algoritmos nos 4 checkpoints.
-- `checkpoint_overlays_best_selection.png`: Evolução visual do mapa de "Best Selection".
-- `checkpoint_evolution_summary.png`: Painel consolidado com curvas de convergência e ganhos de qualidade.
-- `Y_checkpoints.parquet` e `Y_checkpoints.csv`: Tabela estruturada para análises econométricas posteriores.
-- `params_log.md`: Checklist completo dos parâmetros metodológicos.
+- **Critério de Good Performance:** $\\text{{Gap}} \\le {args.epsilon*100:.1f}\\%$
+- **Critério de Best Performance:** Algoritmo com melhor solução na instância
+- **Normalized Area ($A$):** Fração da área do Convex Hull do espaço total dominada pelo algoritmo
+- **Density ($D$):** Concentração de instâncias no footprint relativa à densidade média do espaço
+- **Purity ($P$):** Proporção de instâncias alvo contidas dentro do polígono de fronteira
+
+| Checkpoint | Algoritmo | Good Area ($A$) | Good Density ($D$) | Good Purity ($P$) | Best Area ($A$) | Best Density ($D$) | Best Purity ($P$) | N Good | N Best |
+|:---|:---|---:|---:|---:|---:|---:|---:|---:|---:|
+"""
+    for _, r in df_footprints.iterrows():
+        md_report += (
+            f"| **{r['checkpoint']}%** | **{r['algoritmo']}** | "
+            f"{r['good_area']:.3f} | {r['good_density']:.3f} | {r['good_purity']:.3f} | "
+            f"{r['best_area']:.3f} | {r['best_density']:.3f} | {r['best_purity']:.3f} | "
+            f"{r['n_good']} | {r['n_best']} |\n"
+        )
+
+    md_report += f"""
+## 4. Transição do Melhor Algoritmo por Instância ao Longo dos Checkpoints
+
+| Instância | Vencedor 25% | Vencedor 50% | Vencedor 75% | Vencedor 100% | Gap 100% | Estado |
+|---|---|---|---|---|---:|:---:|
+"""
+    for i_id in sorted(df_consolidated["instancia_id"].unique()):
+        inst_df = df_consolidated[df_consolidated["instancia_id"] == i_id].sort_values("checkpoint")
+        bests = {r["checkpoint"]: r["best_algo"] for _, r in inst_df.iterrows()}
+        final_rows = inst_df[inst_df["checkpoint"] == 100]
+        final_gap = final_rows.iloc[0]["best_gap"] * 100 if len(final_rows) > 0 else 0.0
+        has_changed = len(set(bests.values())) > 1
+        change_str = "Mudou" if has_changed else "Estável"
+        md_report += f"| `{i_id}` | {bests.get(25, '-')} | {bests.get(50, '-')} | {bests.get(75, '-')} | **{bests.get(100, '-')}** | {final_gap:.2f}% | {change_str} |\n"
+
+    md_report += f"""
+## 5. Fundamentação dos Polígonos de Footprint na Literatura de ISA
+
+Na metodologia de Instance Space Analysis (Smith-Miles & Muñoz, 2023; Notice et al., 2025; Gouvêa et al., 2025):
+- As instâncias empíricas testadas são pontos discretos no espaço projetado $(Z_1, Z_2)$.
+- O conceito matemático de **Footprint** ($\mathcal{{F}}$) define a região contínua do espaço onde um determinado algoritmo apresenta desempenho superior (*Best Solver*) ou aceitável (*Good Performance*, $\\text{{Gap}} \\le \\varepsilon$).
+- Para calcular métricas contínuas a partir de uma amostra discreta, a literatura calcula o **Convex Hull** (envoltório convexo bidimensional) que circunscreve as instâncias onde o algoritmo vence.
+- A área normalizada desse polígono ($A = \\text{{Área}}(\\mathcal{{H}}_{{\\text{{algo}}}}) / \\text{{Área}}(\\mathcal{{H}}_{{\\text{{total}}}})$) quantifica o tamanho do nicho de dominância de cada heurística (Notice et al., 2025, Tabela 3).
+- **Formatos de Visualização Gerados:**
+  1. `checkpoint_overlays_best_selection.png`: Exibe os envoltórios poligonais semitransparentes sobrepostos aos pontos, delimitando as fronteiras contínuas de cada algoritmo.
+  2. `checkpoint_overlays_best_selection_points.png`: Exibe dispersão pura de pontos sem polígonos, permitindo inspeção nítida de cada instância individual sem oclusão geométrica.
+
+## 6. Artefatos de Visualização Produzidos
+| Arquivo | Descrição |
+|---|---|
+| `checkpoint_overlays_algorithms.png` | Grade comparativa de todos os algoritmos nos 4 checkpoints |
+| `checkpoint_overlays_best_selection.png` | Evolução visual do Best Selection com polígonos de footprint (Convex Hull) |
+| `checkpoint_overlays_best_selection_points.png` | Evolução visual do Best Selection sem polígonos (dispersão pura de pontos) |
+| `checkpoint_evolution_summary.png` | Painel consolidado com curvas de convergência e ganhos de qualidade |
+| `footprint_metrics.csv` | Tabela formal de métricas de footprint (Area, Density, Purity) |
+| `Y_checkpoints.parquet` / `Y_checkpoints.csv` | Tabela estruturada para análises econométricas posteriores |
+| `params_log.md` | Checklist completo dos parâmetros metodológicos |
 """
     with args.out_report_md.open("w", encoding="utf-8") as f:
         f.write(md_report)

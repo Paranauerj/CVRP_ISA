@@ -984,6 +984,8 @@ def main() -> int:
                         help="orçamento fixo em segundos para todas as instâncias (ex: 20.0), garantindo comparação perfeitamente justa independente de N")
     parser.add_argument("--workers", type=int, default=8,
                          help="número de processos worker (default: 8)")
+    parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True,
+                        help="retoma a execução a partir dos resultados já gravados no CSV (default: True)")
     args = parser.parse_args()
     if args.workers < 1:
         parser.error("--workers deve ser pelo menos 1")
@@ -992,26 +994,139 @@ def main() -> int:
     jobs = [(str(path), algorithm, seed, args.seconds_per_customer, args.time_cap, args.fixed_budget)
             for path in paths for algorithm in args.algorithms for seed in args.seeds]
 
+    # Carregar resultados já gravados se resume estiver ativo
     rows: list[dict] = []
+    completed_jobs: set[tuple[str, str, int]] = set()
+    if args.resume and args.output.exists() and args.output.stat().st_size > 0:
+        try:
+            raw_entries = []
+            checkpoint_counts: dict[tuple[str, str, int], int] = defaultdict(int)
+            with args.output.open("r", newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for r in reader:
+                    r["checkpoint"] = int(r["checkpoint"])
+                    r["cost"] = float(r["cost"])
+                    r["seed"] = int(r["seed"])
+                    r["elapsed_target_seconds"] = float(r["elapsed_target_seconds"])
+                    raw_entries.append(r)
+                    checkpoint_counts[(r["instancia_id"], r["algoritmo"], r["seed"])] += 1
+            for key, count in checkpoint_counts.items():
+                if count >= 4:
+                    completed_jobs.add(key)
+            # Filtrar estritamente linhas de jobs 100% concluídos (remove linhas órfãs de jobs abortados)
+            rows = [r for r in raw_entries if (r["instancia_id"], r["algoritmo"], r["seed"]) in completed_jobs]
+            had_orphans = len(rows) < len(raw_entries)
+            if had_orphans:
+                print(f"[RESUME] Expurgadas {len(raw_entries) - len(rows)} linhas parciais de jobs incompletos em {args.output}.")
+                # Reescrever o arquivo apenas com os dados limpos
+                with args.output.open("w", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=["instancia_id", "algoritmo", "seed", "checkpoint", "elapsed_target_seconds", "cost"])
+                    writer.writeheader()
+                    writer.writerows(rows)
+        except Exception as e:
+            print(f"AVISO: Falha ao ler {args.output} para retomada ({e}). Reiniciando coleta.")
+            rows = []
+            completed_jobs = set()
+
     probing_rows: list[dict] = []
-    if args.workers == 1:
-        for job in jobs:
-            c_rows, p_data = run_job(job)
-            rows.extend(c_rows)
-            if p_data is not None:
-                probing_rows.append(p_data)
-    else:
-        with ProcessPoolExecutor(max_workers=args.workers) as executor:
-            for c_rows, p_data in executor.map(run_job, jobs):
-                rows.extend(c_rows)
-                if p_data is not None:
-                    probing_rows.append(p_data)
+    prob_exists = False
+    if args.resume and args.ils_trace_output.exists() and args.ils_trace_output.stat().st_size > 0:
+        try:
+            raw_prob = []
+            with args.ils_trace_output.open("r", newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for r in reader:
+                    conv_r: dict = {}
+                    for k, v in r.items():
+                        if k in ("instancia_id", "algoritmo"):
+                            conv_r[k] = v
+                        elif k == "seed":
+                            conv_r[k] = int(v)
+                        else:
+                            try:
+                                conv_r[k] = float(v)
+                            except ValueError:
+                                conv_r[k] = v
+                    raw_prob.append(conv_r)
+            # Manter apenas probing de jobs que completaram com sucesso
+            probing_rows = [
+                r for r in raw_prob 
+                if (r["instancia_id"], r.get("algoritmo", "ILS"), r["seed"]) in completed_jobs
+            ]
+            if len(probing_rows) < len(raw_prob):
+                print(f"[RESUME] Expurgadas {len(raw_prob) - len(probing_rows)} linhas parciais de probing em {args.ils_trace_output}.")
+                if probing_rows:
+                    with args.ils_trace_output.open("w", newline="", encoding="utf-8") as f:
+                        writer = csv.DictWriter(f, fieldnames=list(probing_rows[0].keys()))
+                        writer.writeheader()
+                        writer.writerows(probing_rows)
+            prob_exists = len(probing_rows) > 0
+        except Exception as e:
+            print(f"AVISO: Falha ao ler {args.ils_trace_output} para retomada ({e}).")
+            probing_rows = []
+
+    # Filtrar apenas jobs que ainda não foram concluídos
+    pending_jobs = []
+    for j in jobs:
+        inst_id = Path(j[0]).stem
+        alg = j[1]
+        sd = j[2]
+        if (inst_id, alg, sd) not in completed_jobs:
+            pending_jobs.append(j)
+
+    if completed_jobs:
+        print(f"[RESUME] Detectados {len(completed_jobs)} jobs já concluídos com sucesso em {args.output}.")
+        print(f"[RESUME] Executando {len(pending_jobs)} / {len(jobs)} jobs restantes...")
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    with args.output.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=rows[0].keys() if rows else ["instancia_id"])
-        writer.writeheader()
-        writer.writerows(rows)
+    raw_file_exists = args.output.exists() and args.output.stat().st_size > 0 and len(rows) > 0
+    raw_mode = "a" if (args.resume and raw_file_exists) else "w"
+    if not (args.resume and raw_file_exists):
+        rows = []  # se não está em resume ou arquivo não existia, zera
+    raw_handle = args.output.open(raw_mode, newline="", encoding="utf-8")
+    raw_fields = ["instancia_id", "algoritmo", "seed", "checkpoint", "elapsed_target_seconds", "cost"]
+    raw_writer = csv.DictWriter(raw_handle, fieldnames=raw_fields)
+    if not (args.resume and raw_file_exists):
+        raw_writer.writeheader()
+        raw_handle.flush()
+
+    probing_handle = None
+    probing_writer = None
+    if args.ils_trace_output:
+        args.ils_trace_output.parent.mkdir(parents=True, exist_ok=True)
+        prob_mode = "a" if (args.resume and prob_exists) else "w"
+        if not (args.resume and prob_exists):
+            probing_rows = []
+        probing_handle = args.ils_trace_output.open(prob_mode, newline="", encoding="utf-8")
+
+    def save_single_result(c_rows: list[dict], p_data: dict | None) -> None:
+        nonlocal probing_writer
+        if c_rows:
+            raw_writer.writerows(c_rows)
+            raw_handle.flush()
+            rows.extend(c_rows)
+        if p_data is not None and probing_handle:
+            if probing_writer is None:
+                probing_writer = csv.DictWriter(probing_handle, fieldnames=list(p_data.keys()))
+                if not (args.resume and prob_exists):
+                    probing_writer.writeheader()
+            probing_writer.writerow(p_data)
+            probing_handle.flush()
+            probing_rows.append(p_data)
+
+    if pending_jobs:
+        if args.workers == 1:
+            for job in pending_jobs:
+                c_rows, p_data = run_job(job)
+                save_single_result(c_rows, p_data)
+        else:
+            with ProcessPoolExecutor(max_workers=args.workers) as executor:
+                for c_rows, p_data in executor.map(run_job, pending_jobs):
+                    save_single_result(c_rows, p_data)
+
+    raw_handle.close()
+    if probing_handle:
+        probing_handle.close()
 
     grouped: dict[tuple[str, str, int], list[float]] = defaultdict(list)
     for row in rows:

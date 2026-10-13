@@ -232,3 +232,49 @@ In this CVRP ISA pipeline (Step 5, PRELIM):
    - **VRP:** Problem-specific customer-to-depot constraints (`VRP2_cust_to_depot_mean`)
    - **P:** Dynamic Local Search Probing from ILS (`P3_mean_route_length`, `P11_edge_persistence`)
 
+
+
+---
+
+## 7. Machine Learning & Automated Algorithm Selection (AAS) in Instance Space
+
+### Primary References
+> **Rice, J. R. (1976).** "The Algorithm Selection Problem." *Advances in Computers*, 15, 65–118.
+>
+> **Smith-Miles, K., & Muñoz, M. A. (2023).** "Instance Space Analysis for Algorithm Testing: Methodology and Software Tools." *ACM Computing Surveys*, 55(12), 1–33.
+>
+> **Notice, C., et al. (2025).** "Instance Space Analysis of the Capacitated Vehicle Routing Problem with Mixture Discriminant Analysis." *Computers & Operations Research*.
+>
+> **Gouvêa, E., et al. (2025).** "Instance space analysis of the capacitated vehicle routing problem." *European Journal of Operational Research*.
+
+---
+
+### The Two Distinct Machine Learning Tasks in ISA
+
+Na metodologia canônica do MATILDA e nos estudos avançados de CVRP (Notice et al., 2025; Gouvêa et al., 2025), o aprendizado de máquina é empregado em duas frentes complementares:
+
+#### Tarefa A: Previsão de Footprint (Classificação Binária por Algoritmo)
+- **Objetivo:** Para um algoritmo específico $A \in \{\text{ALNS}, \text{ILS}, \text{GLS}, \text{TS}\}$, predizer se ele alcançará "Good Performance" na instância $x$ ($Y_A(x) \le \varepsilon$, onde $\varepsilon$ é o limiar canônico mediano do PRELIM).
+- **Rótulo ($y$):** Binário ($1$ se $Y_A \le \varepsilon$, $0$ se $Y_A > \varepsilon$).
+- **Finalidade:** Delimitar as fronteiras geométricas do nicho de dominância contínuo (*footprint*) de cada solver no espaço bidimensional.
+
+#### Tarefa B: Seleção do Melhor Algoritmo (*Best Algorithm Selection* / AAS — Multi-classe)
+- **Objetivo:** Dentre todos os algoritmos do portfólio, predizer diretamente qual deles encontrará a solução com o menor custo na instância $x$:
+  $$A^*(x) = \arg\min_{A \in \mathcal{A}} \text{Cost}(A, x)$$
+- **Rótulo ($y$):** Categórico ($\text{ALNS}, \text{ILS}, \text{GLS}, \text{TS}$).
+- **Finalidade Operacional:** Permitir que, diante de uma instância nova e desconhecida, o praticante ou sistema automatizado selecione a meta-heurística ideal com base apenas em suas características projetadas $(Z_1, Z_2)$, evitando o custo computacional proibitivo de executar todo o portfólio.
+
+---
+
+### Significado Científico de Alta Acurácia no Espaço PILOT 2D $(Z_1, Z_2)$
+
+Quando modelos clássicos de aprendizado supervisionado (como SVM com kernel RBF e Random Forest) atingem **alta acurácia (ex.: 85% a 95%)** utilizando **apenas as duas coordenadas projetadas $(Z_1, Z_2)$**, isso estabelece três comprovações científicas centrais:
+
+1. **Preservação de Informação Discriminatória:**
+   O processo analítico de redução dimensional (SIFTED $\to$ PILOT), que condensou 63 características iniciais em apenas 2 eixos lineares ortogonais, reteve com sucesso as propriedades estruturais que determinam o sucesso ou fracasso de cada algoritmo. O espaço 2D não é apenas uma representação estética, mas um mapa funcional de desempenho.
+
+2. **Separabilidade Territorial Nítida:**
+   Os algoritmos do portfólio não vencem de forma aleatória ou caótica; seus nichos de superioridade formam regiões compactas e bem definidas no plano $(Z_1, Z_2)$. As fronteiras de decisão aprendidas pelo SVM espelham transições físicas reais na estrutura das instâncias (ex.: transição de clientes clusterizados para dispersos, ou de alta para baixa restritividade de capacidade).
+
+3. **Validação do Sistema de Recomendação (AAS):**
+   Confirma a viabilidade prática do Automated Algorithm Selection com custo de inferência desprezível ($O(1)$ após extração rápida de features), entregando qualidade de solução próxima à do oráculo perfeito (*Virtual Best Solver*) com uma fração do orçamento computacional.

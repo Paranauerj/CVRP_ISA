@@ -211,6 +211,16 @@ def generate_pipeline_summary(
         "",
         "## 2. Acurácia dos Modelos de Machine Learning (SVM e Random Forest)",
         "",
+        "### Fundamentação Teórica e Significado Científico no ISA",
+        "Na metodologia canônica de Instance Space Analysis (*Smith-Miles & Muñoz, 2023*; *Notice et al., 2025*; *Gouvêa et al., 2025*), avaliam-se duas tarefas essenciais de Aprendizado de Máquina:",
+        "1. **Previsão de Footprint (Classificação Binária):** Para cada algoritmo individual, prevê se ele apresentará bom desempenho ($Y \\le \\varepsilon$) com base nas características da instância.",
+        "2. **Seleção do Melhor Algoritmo (*Best Algorithm Selection* / AAS — Multi-classe):** Prevê diretamente qual meta-heurística (ALNS, ILS, GLS, TS) produzirá o menor custo para a instância.",
+        "",
+        "Quando os classificadores (especialmente o SVM RBF) atingem alta acurácia usando **exclusivamente as duas coordenadas projetadas $(Z_1, Z_2)$**, isso fornece três comprovações científicas centrais:",
+        "- **Preservação de Informação:** O espaço 2D construído analiticamente pelo PILOT não perdeu a informação discriminatória contida nas características originais.",
+        "- **Separabilidade Territorial:** As coordenadas $(Z_1, Z_2)$ conseguiram delimitar com nitidez as fronteiras e nichos de dominância de cada meta-heurística.",
+        "- **Validação de AAS:** Permite que instâncias novas tenham o seu algoritmo ideal selecionado a custo computacional de inferência quase nulo ($O(1)$), dispensando a execução redundante de todo o portfólio.",
+        "",
         f"- **Método de Validação Cruzada:** {ml_results.get('cv_method', 'N/A')}",
         f"- **Tolerância de Desempenho (ε):** `{ml_results.get('epsilon', 0.1717):.4f}`",
         "",
@@ -235,14 +245,18 @@ def generate_pipeline_summary(
         f"- **Acurácia Random Forest em (Z1, Z2):** **{best_data.get('rf_2d_accuracy', 0.0)*100:.1f}%**",
         f"- **Acurácia Random Forest em F_sifted (10 features):** **{best_data.get('rf_sifted_accuracy', 0.0)*100:.1f}%**",
         "",
-        "## 3. Conclusões Científicas do Estudo de Caso",
+        "## 3. Painel de Visualizações e Artefatos Gráficos Gerados",
         "",
-        "1. **Poder Sintético da Projeção PILOT:**",
-        "   - A acurácia do classificador SVM nas duas coordenadas $(Z_1, Z_2)$ atinge **90.0%**, superando a Random Forest operando no espaço dimensional de 10 features brutas (70.0%).",
-        "   - Isso demonstra formalmente que a projeção PILOT não apenas reduz a dimensionalidade, mas atua como um filtro linear que concentra a variância de desempenho de forma observável.",
-        "2. **Dinâmica Temporal dos Solvers (AAS):**",
-        "   - Em orçamentos restritos ($25\\%$ de tempo), a descida rápida de vizinhança do **ILS** domina quase a totalidade das instâncias.",
-        "   - Conforme o orçamento atinge $100\\%$, o **ALNS** assume as instâncias com topologia severa e distorção climática (*snow*), pois seus operadores adaptativos de destruição em larga escala são os únicos capazes de escapar de bacias de atração de mínimos locais profundos.",
+        "| Arquivo de Imagem | Conteúdo / Descrição | Finalidade no Estudo |",
+        "|---|---|---|",
+        "| `prelim_distribution.png` | Boxplots, histogramas e curvas ECDF da distribuição de Y | Calibração empírica da tolerância ε |",
+        "| `sifted_clusters.png` | Agrupamento dos 10 clusters e matriz de correlação das features | Diagnóstico do estágio SIFTED |",
+        "| `instance_space_pilot.png` | Espaço 2D PILOT (Z1, Z2) com biplot loadings e correlações | Mapa canônico de referência das instâncias |",
+        "| `feature_distribution_maps.png` | Dispersão individual das top características no plano Z (Notice et al., 2025, Fig. 5) | Interpretabilidade física dos eixos PILOT |",
+        "| `checkpoint_overlays_algorithms.png` | Matriz de dispersão de gaps por solver e checkpoint (25%-100%) | Rastreamento temporal de qualidade |",
+        "| `checkpoint_overlays_best_selection.png` | Mapa discreto do solver vencedor por checkpoint com polígonos de footprint | Delimitação de envelopes temporais de domínio |",
+        "| `checkpoint_overlays_best_selection_points.png` | Dispersão individual do solver vencedor sem polígonos | Visualização desobstruída de cada instância |",
+        "| `checkpoint_evolution_summary.png` | Fatias agregadas de vitória e redução percentual de custo | Dinâmica temporal de dominância |",
         "",
         "## 4. Checklist de Artefatos Gerados no Repositório da Run",
         "",
@@ -256,9 +270,12 @@ def generate_pipeline_summary(
         "- `F_sifted.parquet` / `sifted_clusters.png` — 10 características selecionadas e clusters ortogonais",
         "- `Z_matrix.json` / `projected_coords.parquet` — Projeção PILOT e coordenadas 2D",
         "- `instance_space_pilot.png` — Mapa em 4 quadrantes com biplot loadings",
-        "- `checkpoint_overlays_algorithms.png` — Grade $4 \\times 3$ de gap por algoritmo",
-        "- `checkpoint_overlays_best_selection.png` — Evolução das regiões de domínio",
+        "- `feature_distribution_maps.png` — Mapas de distribuição das características estruturais (Notice Fig. 5)",
+        "- `checkpoint_overlays_algorithms.png` — Grade 4x3 de gap por algoritmo",
+        "- `checkpoint_overlays_best_selection.png` — Evolução com polígonos de footprint (Convex Hull)",
+        "- `checkpoint_overlays_best_selection_points.png` — Dispersão pura do melhor algoritmo sem polígonos",
         "- `checkpoint_evolution_summary.png` — Gráficos agregados de convergência",
+        "- `footprint_metrics.csv` — Métricas formais de footprint (Area, Density, Purity) por checkpoint",
         "- `params_log.md` — Rascunho metodológico consolidado para o artigo científico",
         "- `ml_models_accuracy.json` — Métricas numéricas de validação cruzada dos modelos de ML",
     ])
@@ -299,6 +316,8 @@ def main() -> int:
                         help="Diretório contendo checkpoint_costs_median.csv e ils_probing_median.csv para reaproveitar quando --skip-benchmark for usado")
     parser.add_argument("--limit", type=int, default=None,
                         help="Limite de instâncias para amostragem ou teste rápido")
+    parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True,
+                        help="retoma etapas a partir de resultados intermediários existentes (default: True)")
 
     # Parâmetros de Benchmark (Etapa 1)
     parser.add_argument("--algorithms", nargs="+", default=["ALNS", "ILS", "GLS", "TS"],
@@ -387,6 +406,10 @@ def main() -> int:
         ]
         if args.limit:
             cmd_1.extend(["--limit", str(args.limit)])
+        if args.resume:
+            cmd_1.append("--resume")
+        else:
+            cmd_1.append("--no-resume")
         timings["Etapa 1: Benchmark e Probing"] = run_command(cmd_1, "01_run_algorithms.py", log_file)
     else:
         print("\n⏩ Pulando Etapa 1 (Reutilizando custos pré-computados)")
@@ -478,6 +501,7 @@ def main() -> int:
     z_npy = out_dir / "Z_matrix.npy"
     pilot_md = out_dir / "pilot_report.md"
     pilot_plot = out_dir / "instance_space_pilot.png"
+    feature_maps_plot = out_dir / "feature_distribution_maps.png"
 
     cmd_5 = [
         py_exec, "05_pilot.py",
@@ -490,6 +514,7 @@ def main() -> int:
         "--out-z-npy", str(z_npy),
         "--out-report-md", str(pilot_md),
         "--out-plot", str(pilot_plot),
+        "--out-feature-maps", str(feature_maps_plot),
     ]
     timings["Etapa 5: PILOT (Projeção Z)"] = run_command(cmd_5, "05_pilot.py", log_file)
 
@@ -498,8 +523,10 @@ def main() -> int:
     # -----------------------------------------------------------------------
     cp_parquet = out_dir / "Y_checkpoints.parquet"
     cp_csv = out_dir / "Y_checkpoints.csv"
+    footprint_csv = out_dir / "footprint_metrics.csv"
     cp_plot_algs = out_dir / "checkpoint_overlays_algorithms.png"
     cp_plot_best = out_dir / "checkpoint_overlays_best_selection.png"
+    cp_plot_best_points = out_dir / "checkpoint_overlays_best_selection_points.png"
     cp_plot_summary = out_dir / "checkpoint_evolution_summary.png"
     cp_report_md = out_dir / "checkpoint_overlay_report.md"
     params_log_md = out_dir / "params_log.md"
@@ -511,8 +538,10 @@ def main() -> int:
         "--instances-dir", str(args.instances_dir),
         "--out-checkpoints-parquet", str(cp_parquet),
         "--out-checkpoints-csv", str(cp_csv),
+        "--out-footprint-metrics", str(footprint_csv),
         "--out-plot-algorithms", str(cp_plot_algs),
         "--out-plot-best", str(cp_plot_best),
+        "--out-plot-best-points", str(cp_plot_best_points),
         "--out-plot-summary", str(cp_plot_summary),
         "--out-report-md", str(cp_report_md),
         "--out-params-log", str(params_log_md),

@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import time
 from pathlib import Path
@@ -290,6 +291,79 @@ def generate_pilot_plots(
     print(f"[OK] Painel PILOT salvo em: {output_png}")
 
 
+def generate_feature_distribution_maps(
+    df_coords: pd.DataFrame,
+    df_features: pd.DataFrame,
+    metadata: dict,
+    output_png: Path,
+) -> None:
+    """
+    Gera grade de dispersão no espaço PILOT 2D (Z1, Z2) com as características individuais.
+    Alinhado à Figura 5 de Notice et al. (2025) e às visualizações padrão do MATILDA.
+    """
+    loadings = metadata.get("loadings", {})
+    # Ordenar features por magnitude de loading vetorial sqrt(Z1^2 + Z2^2)
+    ranked_feats = sorted(
+        df_features.columns,
+        key=lambda f: loadings.get(f, {}).get("Z1", 0.0) ** 2 + loadings.get(f, {}).get("Z2", 0.0) ** 2,
+        reverse=True,
+    )
+    selected_feats = ranked_feats[:min(6, len(ranked_feats))]
+    n_feats = len(selected_feats)
+    if n_feats == 0:
+        return
+
+    n_cols = 3 if n_feats > 4 else 2
+    n_rows = math.ceil(n_feats / n_cols)
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(5.5 * n_cols, 4.6 * n_rows), squeeze=False)
+    fig.suptitle(
+        "Distribuição das Características Estruturais no Espaço PILOT (Z1, Z2)\n(Conforme Notice et al., 2025 — Figura 5)",
+        fontsize=14,
+        fontweight="bold",
+    )
+
+    z1 = df_coords["Z1"].values
+    z2 = df_coords["Z2"].values
+
+    for idx, feat in enumerate(selected_feats):
+        r = idx // n_cols
+        c = idx % n_cols
+        ax = axes[r, c]
+
+        vals = df_features.loc[df_coords.index, feat].values
+        ld_z1 = loadings.get(feat, {}).get("Z1", 0.0)
+        ld_z2 = loadings.get(feat, {}).get("Z2", 0.0)
+
+        sc = ax.scatter(z1, z2, c=vals, cmap="viridis", s=90, edgecolor="black", alpha=0.9, zorder=3)
+        cbar = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
+        cbar.ax.tick_params(labelsize=8)
+
+        if len(df_coords) <= 30:
+            for inst_id, row in df_coords.iterrows():
+                short = str(inst_id).split("_")[0] + "_" + str(inst_id).split("_")[-1]
+                ax.annotate(short, (row["Z1"], row["Z2"]), fontsize=6, alpha=0.7,
+                            xytext=(3, 3), textcoords="offset points")
+
+        ax.axhline(0, color="gray", linestyle=":", alpha=0.4)
+        ax.axvline(0, color="gray", linestyle=":", alpha=0.4)
+        ax.grid(True, linestyle=":", alpha=0.4)
+        ax.set_title(f"{feat}\n(r_Z1 = {ld_z1:+.2f}, r_Z2 = {ld_z2:+.2f})", fontsize=10, fontweight="bold")
+        ax.set_xlabel("Coordenada Z1", fontsize=9)
+        ax.set_ylabel("Coordenada Z2", fontsize=9)
+
+    for idx in range(n_feats, n_rows * n_cols):
+        r = idx // n_cols
+        c = idx % n_cols
+        axes[r, c].set_visible(False)
+
+    plt.tight_layout()
+    output_png.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(output_png, dpi=300)
+    plt.close()
+    print(f"[OK] Mapas de distribuição de features salvos em: {output_png}")
+
+
 # ---------------------------------------------------------------------------
 # CLI e Execução Principal
 # ---------------------------------------------------------------------------
@@ -357,6 +431,12 @@ def main() -> None:
         type=Path,
         default=Path("instance_space_pilot.png"),
         help="Gráfico diagnóstico do espaço de instâncias. Padrão: instance_space_pilot.png",
+    )
+    parser.add_argument(
+        "--out-feature-maps",
+        type=Path,
+        default=Path("feature_distribution_maps.png"),
+        help="Painel de dispersão de características individuais no espaço 2D (conforme Notice et al., 2025, Fig. 5). Padrão: feature_distribution_maps.png",
     )
 
     args = parser.parse_args()
@@ -441,6 +521,7 @@ def main() -> None:
     args.out_z_npy.parent.mkdir(parents=True, exist_ok=True)
     args.out_z_json.parent.mkdir(parents=True, exist_ok=True)
     args.out_plot.parent.mkdir(parents=True, exist_ok=True)
+    args.out_feature_maps.parent.mkdir(parents=True, exist_ok=True)
     args.out_report_md.parent.mkdir(parents=True, exist_ok=True)
 
     df_coords.to_parquet(args.out_coords_parquet)
@@ -491,6 +572,7 @@ def main() -> None:
 
     # 7. Gerar Gráficos Diagnósticos
     generate_pilot_plots(df_coords, df_y, metadata, args.out_plot)
+    generate_feature_distribution_maps(df_coords, df_f, metadata, args.out_feature_maps)
 
     # 8. Salvar Relatório Markdown
     md_content = f"""# PILOT — Relatório da Matriz de Projeção Linear 2D (Etapa 7)
@@ -541,13 +623,14 @@ As coordenadas de qualquer instância CVRP (existente ou nova) são calculadas p
 
 ## 3. Alinhamento com o Desempenho dos Algoritmos (Linearidade Observável)
 
-| Algoritmo | Correlação com $Z_1$ | Correlação com $Z_2$ | Comportamento no Espaço |
-|---|---|---|---|
+| Algoritmo | Correlação com $Z_1$ ($r_{{a, Z_1}}$) | Correlação com $Z_2$ ($r_{{a, Z_2}}$) | Magnitude do Gradiente ($\\sqrt{{r_1^2 + r_2^2}}$) |
+|---|---:|---:|---:|
 """
     for alg in algorithm_names:
         c1 = metadata["correlations_Z1"][alg]
         c2 = metadata["correlations_Z2"][alg]
-        md_content += f"| **{alg}** | {c1:+.4f} | {c2:+.4f} | Gap cresce continuamente rumo ao topo-direito |\n"
+        grad_mag = np.sqrt(c1**2 + c2**2)
+        md_content += f"| **{alg}** | {c1:+.4f} | {c2:+.4f} | {grad_mag:.4f} |\n"
 
     md_content += f"""
 ---
@@ -563,8 +646,13 @@ As coordenadas de qualquer instância CVRP (existente ou nova) são calculadas p
     md_content += f"""
 ---
 
-## 5. Próximo Passo
-Com as coordenadas $(Z_1, Z_2)$ e a matriz de projeção $\\mathbf{{Z}}$ rigorosamente fixadas, podemos avançar para a **Etapa 8 (Overlay dos Checkpoints no Espaço Fixo — `06_overlay_checkpoints.py`)** para gerar os gráficos dos checkpoints (25%, 50%, 75%, 100%) e o mapa dinâmico de "Best Selection".
+## 5. Artefatos de Visualização Produzidos
+| Arquivo | Descrição |
+|---|---|
+| `instance_space_pilot.png` | Painel 4 quadrantes com projeção 2D, vetores biplot, cargas fatoriais e alinhamento linear |
+| `feature_distribution_maps.png` | Mapas contínuos de distribuição das características estruturais no espaço (Notice et al., 2025, Fig. 5) |
+| `projected_coords.parquet` / `projected_coords.csv` | Coordenadas finais (Z1, Z2) de cada instância |
+| `Z_matrix.json` / `Z_matrix.npy` | Matriz de projeção e equações lineares de transformação |
 """
     with args.out_report_md.open("w", encoding="utf-8") as f:
         f.write(md_content)
