@@ -48,7 +48,38 @@ def extract_instance_features(vrp_path: Path) -> dict:
     depot_idx = 0
     cust_indices = np.arange(1, n_nodes)
 
-    features: dict[str, float] = {"instancia_id": inst_id, "N": float(n_cust)}
+    # Normalização Canônica das Coordenadas Espaciais para grid [0, 1000] x [0, 1000]
+    # Conforme Notice et al. (2025, p. 4), preservando a proporção de aspecto espacial:
+    if coords is not None and len(coords) > 1:
+        min_c = np.min(coords, axis=0)
+        max_c = np.max(coords, axis=0)
+        orig_dx = float(max_c[0] - min_c[0])
+        orig_dy = float(max_c[1] - min_c[1])
+        orig_aspect_ratio = float(min(orig_dx, orig_dy) / max(1e-6, max(orig_dx, orig_dy)))
+        span = np.maximum(max_c - min_c, 1e-6)
+        max_span = float(max(span[0], span[1]))
+        coords = ((coords - min_c) / max_span) * 1000.0
+        # Recomputar distâncias euclidianas calibradas no grid canônico [0, 1000]
+        dist = np.linalg.norm(coords[:, None, :] - coords[None, :, :], axis=-1)
+        norm_dx = float(np.max(coords[:, 0]) - np.min(coords[:, 0]))
+        norm_dy = float(np.max(coords[:, 1]) - np.min(coords[:, 1]))
+        effective_area = max(1.0, norm_dx * norm_dy)
+        scale_factor = 1000.0 / max_span
+    else:
+        orig_aspect_ratio = 1.0
+        effective_area = 1000.0 * 1000.0
+        # Fallback para distâncias puras sem coordenadas
+        max_d = float(np.max(dist[np.isfinite(dist)])) if np.any(np.isfinite(dist)) else 1.0
+        if max_d > 1e-6:
+            dist = (dist / max_d) * 1000.0
+        scale_factor = 1000.0 / max_d if max_d > 1e-6 else 1.0
+
+    features: dict[str, float] = {
+        "instancia_id": inst_id,
+        "N": float(n_cust),
+        "_scale_factor": float(scale_factor),
+        "_effective_area": float(effective_area),
+    }
 
     # Triângulo superior das distâncias (pares não-direcionados sem auto-arestas)
     tri_i, tri_j = np.triu_indices(n_nodes, k=1)
@@ -62,13 +93,16 @@ def extract_instance_features(vrp_path: Path) -> dict:
     features["ND1_dist_median"] = float(np.median(upper_dists))
     features["ND1_dist_kurtosis"] = float(kurtosis(upper_dists)) if len(upper_dists) > 3 else 0.0
 
-    # ND2: soma das arestas de menor custo para cada nó (excluindo a si mesmo)
+    # ND2: soma das distâncias mínimas normalizada pelo fator de Beardwood-Halton-Hammersley (BHH) / Clark-Evans:
+    # Em uma área de suporte efetiva A_real, E[sum(min_edge)] ~ 0.5 * sqrt(N * A_real). Dividir por sqrt(N * A_real)
+    # quebra a colinearidade com NN1_mean e G1_aspect_ratio, refletindo puramente o padrão de agregação espacial
+    # (clusterizado < 0.5, uniforme ~ 0.5, disperso > 0.5), mesmo para regiões de aspecto alongado.
     min_edges = []
     for i in range(n_nodes):
         row = dist[i].copy()
         row[i] = np.inf
         min_edges.append(np.min(row))
-    features["ND2_min_edge_sum"] = float(np.sum(min_edges))
+    features["ND2_min_edge_sum"] = float(np.sum(min_edges) / np.sqrt(max(1.0, n_nodes * effective_area)))
 
     # ND3: fração de distâncias distintas
     features["ND3_distinct_dist_ratio"] = float(len(np.unique(upper_dists)) / max(1, len(upper_dists)))
@@ -84,8 +118,8 @@ def extract_instance_features(vrp_path: Path) -> dict:
         features["ND5_dist_to_centroid_mean"] = float(np.mean(dists_to_centroid))
         features["ND5_dist_to_centroid_std"] = float(np.std(dists_to_centroid))
 
-        # ND6 - ND9: Clustering adaptativo via DBSCAN
-        eps_val = float(np.percentile(min_edges[1:], 75) * 1.5)
+        # ND6 - ND9: Clustering adaptativo via DBSCAN escalonado por sqrt(A_real / N) (Notice et al., 2025)
+        eps_val = float(np.sqrt(effective_area / max(1.0, float(n_cust))))
         eps_val = max(1.0, eps_val)
         db = DBSCAN(eps=eps_val, min_samples=3).fit(cust_coords)
         labels = db.labels_
@@ -96,7 +130,7 @@ def extract_instance_features(vrp_path: Path) -> dict:
         features["ND9_clusters_per_node"] = float(n_clusters / max(1, n_cust))
 
         if n_clusters > 0:
-            c_sizes = [float(np.sum(labels == c_id)) for c_id in unique_clusters]
+            c_sizes = [float(np.sum(labels == c_id) / max(1, n_cust)) for c_id in unique_clusters]
             features["ND7_cluster_size_mean"] = float(np.mean(c_sizes))
             features["ND7_cluster_size_std"] = float(np.std(c_sizes))
         else:
@@ -124,23 +158,25 @@ def extract_instance_features(vrp_path: Path) -> dict:
     # -----------------------------------------------------------------------
     # 2. MST — Árvore geradora mínima (MST1 a MST3)
     # -----------------------------------------------------------------------
+    # No CVRP com V = N + 1 vértices, a MST possui exatamente N arestas.
     mst_csr = csgraph.minimum_spanning_tree(dist)
     mst_weights = mst_csr.data
     features["MST1_edge_cost_mean"] = float(np.mean(mst_weights)) if len(mst_weights) > 0 else 0.0
     features["MST1_edge_cost_std"] = float(np.std(mst_weights)) if len(mst_weights) > 0 else 0.0
     features["MST1_edge_cost_median"] = float(np.median(mst_weights)) if len(mst_weights) > 0 else 0.0
-    features["MST1_edge_cost_sum"] = float(np.sum(mst_weights)) if len(mst_weights) > 0 else 0.0
+    # MST1_sum normalizado pelo fator assintótico BHH/Steele (beta_MST * sqrt(N * A_real))
+    # utilizando a área de suporte efetiva da caixa envolvente:
+    features["MST1_edge_cost_sum"] = float(np.sum(mst_weights) / np.sqrt(max(1.0, n_cust * effective_area))) if len(mst_weights) > 0 else 0.0
 
-    # MST2: graus dos nós na MST
+    # MST2: graus dos nós na MST (nota: grau médio em qualquer árvore de N+1 nós é identicamente 2N/(N+1), omitido por redundância algébrica)
     adj_undirected = (mst_csr + mst_csr.T > 0).astype(float)
     degrees = np.array(adj_undirected.sum(axis=1)).flatten()
-    features["MST2_node_degree_mean"] = float(np.mean(degrees))
     features["MST2_node_degree_std"] = float(np.std(degrees))
     features["MST2_node_degree_max"] = float(np.max(degrees))
 
-    # MST3: profundidade da MST a partir do depósito (hops)
+    # MST3: profundidade relativa da MST a partir do depósito (normalizada por N clientes, strictly in [1/N, 1])
     depths = csgraph.dijkstra(adj_undirected, indices=depot_idx, unweighted=True)
-    features["MST3_tree_depth"] = float(np.max(depths[np.isfinite(depths)]))
+    features["MST3_tree_depth"] = float(np.max(depths[np.isfinite(depths)]) / max(1, n_cust))
 
     # -----------------------------------------------------------------------
     # 3. G — Geométricas (G1 a G5)
@@ -148,7 +184,7 @@ def extract_instance_features(vrp_path: Path) -> dict:
     if coords is not None and len(coords) >= 4:
         min_x, max_x = float(coords[:, 0].min()), float(coords[:, 0].max())
         min_y, max_y = float(coords[:, 1].min()), float(coords[:, 1].max())
-        features["G1_bbox_area"] = float((max_x - min_x) * (max_y - min_y))
+        features["G1_aspect_ratio"] = orig_aspect_ratio
 
         hull = ConvexHull(coords)
         features["G2_hull_area"] = float(hull.volume)  # Em 2D, volume é a área do fecho
@@ -175,7 +211,7 @@ def extract_instance_features(vrp_path: Path) -> dict:
         features["G5_hull_edge_len_mean"] = float(np.mean(edge_lens))
         features["G5_hull_edge_len_std"] = float(np.std(edge_lens))
     else:
-        features["G1_bbox_area"] = 0.0
+        features["G1_aspect_ratio"] = 1.0
         features["G2_hull_area"] = 0.0
         features["G3_hull_points_ratio"] = 0.0
         features["G4_interior_dist_mean"] = 0.0
@@ -199,17 +235,18 @@ def extract_instance_features(vrp_path: Path) -> dict:
 
     n_scc, scc_labels = csgraph.connected_components(adj_knn, connection="strong")
     n_wcc, wcc_labels = csgraph.connected_components(adj_knn, connection="weak")
-    features["NN2_n_scc"] = float(n_scc)
-    features["NN3_n_wcc"] = float(n_wcc)
+    features["NN2_n_scc"] = float(n_scc / max(1, n_nodes))
+    features["NN3_n_wcc"] = float(n_wcc / max(1, n_nodes))
 
     scc_sizes = np.bincount(scc_labels)
     wcc_sizes = np.bincount(wcc_labels)
-    features["NN4_scc_size_mean"] = float(np.mean(scc_sizes))
-    features["NN5_wcc_size_mean"] = float(np.mean(wcc_sizes))
+    features["NN4_scc_size_mean"] = float(np.mean(scc_sizes) / max(1, n_nodes))
+    features["NN5_wcc_size_mean"] = float(np.mean(wcc_sizes) / max(1, n_nodes))
 
     in_degrees = np.sum(adj_knn, axis=0)
-    features["NN6_in_degree_mean"] = float(np.mean(in_degrees))
+    # Nota: em grafo k-NN direcionado com k=3, a média do grau de entrada é identicamente 3.0 (Lema do Aperto de Mãos), omitida por variância zero
     features["NN6_in_degree_std"] = float(np.std(in_degrees))
+    features["NN6_in_degree_max"] = float(np.max(in_degrees))
 
     features["NN7_scc_to_wcc_ratio"] = float(n_scc / max(1, n_wcc))
 
@@ -263,5 +300,14 @@ def extract_instance_features(vrp_path: Path) -> dict:
     features["VRP4_demand_to_capacity_ratio"] = float(tot_demand / max(1.0, capacity))
     mean_dem = float(np.mean(cust_demands)) if len(cust_demands) > 0 else 1.0
     features["VRP5_avg_cust_per_vehicle"] = float(capacity / max(1e-6, mean_dem))
+    k_min = max(1.0, float(np.ceil(tot_demand / max(1.0, capacity))))
+    features["VRP6_fleet_utilization"] = float(tot_demand / (k_min * max(1.0, capacity)))
+
+    # Sanitização defensiva: substitui qualquer NaN ou Inf gerado em momentos estatísticos degenerados por 0.0
+    for k in list(features.keys()):
+        if k != "instancia_id":
+            v = features[k]
+            if np.isnan(v) or np.isinf(v):
+                features[k] = 0.0
 
     return features

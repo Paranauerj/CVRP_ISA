@@ -1,6 +1,10 @@
 outputs/
+instances/
+test_instances_*/
+scratch/
 *.pyc
 __pycache__/
 *.parquet
 *.npy
 *.png
+*.log

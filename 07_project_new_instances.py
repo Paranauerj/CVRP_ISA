@@ -134,8 +134,8 @@ def plot_projection_overlay(
         label=f"Novas Instâncias Projetadas (N={len(df_new)})", zorder=5
     )
 
-    # Rótulos para novas instâncias se N <= 30
-    if len(df_new) <= 30:
+    # Rótulos para novas instâncias apenas se N <= 12 para evitar poluição visual
+    if len(df_new) <= 12:
         for inst_id, row in df_new.iterrows():
             ax.annotate(
                 str(inst_id),

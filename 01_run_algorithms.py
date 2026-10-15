@@ -67,6 +67,8 @@ Requisitos:
 """
 from __future__ import annotations
 
+import os
+
 import argparse
 import csv
 import random
@@ -116,7 +118,6 @@ class Instance:
 
 def load_instance(path: Path) -> Instance:
     data = vrplib.read_instance(str(path))
-    distance = np.asarray(data["edge_weight"], dtype=float)
     demand = np.asarray(data["demand"], dtype=float)
     capacity = float(data["capacity"])
     coords = (
@@ -124,6 +125,16 @@ def load_instance(path: Path) -> Instance:
         if "node_coord" in data and data["node_coord"] is not None
         else None
     )
+    if coords is not None:
+        # Padrão CVRPBenchmark / TSPLIB: distância euclidiana inteira (nint) a partir de node_coord
+        n_nodes = len(coords)
+        distance = np.zeros((n_nodes, n_nodes), dtype=float)
+        for i in range(n_nodes):
+            for j in range(n_nodes):
+                if i != j:
+                    distance[i, j] = int(math.hypot(coords[i, 0] - coords[j, 0], coords[i, 1] - coords[j, 1]) + 0.5)
+    else:
+        distance = np.asarray(data["edge_weight"], dtype=float)
     return Instance(path.stem, distance, demand, capacity, path, coords)
 
 
@@ -197,9 +208,28 @@ def validate_solution(routes: list[list[int]], demand: np.ndarray, capacity: flo
         raise ValueError(f"[{algo_name}] Clientes faltantes detectados: {missing}")
 
 
-def create_pyvrp_local_search(vrp_path: Path, seed: int):
+def create_pyvrp_local_search(instance: Instance, seed: int):
     """Cria e inicializa o motor LocalSearch em C++ do PyVRP com todos os 13 operadores."""
-    data = pyvrp.read(str(vrp_path), round_func="round")
+    if instance.coords is not None:
+        coords = instance.coords
+        n = len(coords)
+        m = pyvrp.Model()
+        depot = m.add_depot(x=coords[0, 0], y=coords[0, 1])
+        clients = [
+            m.add_client(x=coords[i, 0], y=coords[i, 1], delivery=int(instance.demand[i]))
+            for i in range(1, n)
+        ]
+        for i in range(n):
+            for j in range(n):
+                if i != j:
+                    loc_i = depot if i == 0 else clients[i - 1]
+                    loc_j = depot if j == 0 else clients[j - 1]
+                    m.add_edge(loc_i, loc_j, distance=int(instance.distance[i, j]))
+        m.add_vehicle_type(num_available=n, capacity=int(instance.capacity))
+        data = m.data()
+    else:
+        data = pyvrp.read(str(instance.path), round_func="round")
+
     rng = RandomNumberGenerator(seed=seed)
     neighbours = compute_neighbours(data, NeighbourhoodParams())
     ls = LocalSearch(data, rng, neighbours)
@@ -478,7 +508,7 @@ def _run_alns_core(instance: Instance, seed: int, deadline: float, run_start: fl
     """Núcleo de execução do ALNS — construtiva PCI, operadores de destroy/repair,
     seleção roulette-wheel, Simulated Annealing e polimento PyVRP C++."""
     events: list[tuple[float, float]] = []
-    pyvrp_data, pyvrp_ls, pyvrp_cost_eval = create_pyvrp_local_search(instance.path, seed)
+    pyvrp_data, pyvrp_ls, pyvrp_cost_eval = create_pyvrp_local_search(instance, seed)
     repair_regret2, repair_regret3, repair_greedy, pyvrp_polish = make_repair_operators(
         pyvrp_data, pyvrp_ls, pyvrp_cost_eval
     )
@@ -591,7 +621,7 @@ def get_route_edges(routes: list[list[int]]) -> set[tuple[int, int]]:
 
 def run_ils(instance: Instance, seed: int, deadline: float, run_start: float) -> tuple[list[tuple[float, float]], dict]:
     events: list[tuple[float, float]] = []
-    pyvrp_data, pyvrp_ls, pyvrp_cost_eval = create_pyvrp_local_search(instance.path, seed)
+    pyvrp_data, pyvrp_ls, pyvrp_cost_eval = create_pyvrp_local_search(instance, seed)
     dist = instance.distance
     dem = instance.demand
     cap = instance.capacity

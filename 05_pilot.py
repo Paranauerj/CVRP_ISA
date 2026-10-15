@@ -62,17 +62,22 @@ def fit_pilot_analytical(
     n_try: int = 30,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
     """
-    Computa a solução analítica em forma fechada do PILOT para projeção 2D.
-    Resolve o problema de autovalores generalizados: M v = lambda S v
-    onde S é a matriz de dispersão de X e M é o operador combinado de reconstrução e alinhamento de Y.
+    Computa a solução analítica canônica em forma fechada do PILOT (MATILDA/ISA).
+    Conforme Muñoz, Villanova, Baatar, & Smith-Miles (2018) e Smith-Miles & Muñoz (2023):
+    1. Constrói a matriz empilhada padronizada X_bar = [X | Y] em R^{n x (p + m)}.
+    2. Extrai as coordenadas ideais 2D Z* = U[:, :2] * s[:2] via SVD de X_bar.
+    3. Projeta linearmente sobre X via Mínimos Quadrados Ordinários (OLS): A = pinv(X) @ Z*.
+    4. Aplica N_try rotações para alinhar a dureza ao quadrante superior (+Z1, +Z2).
+    5. As coordenadas finais Z = X @ A_final são estritamente lineares nas características,
+       sem qualquer vazamento de Y no cálculo da coordenada final (Eq. 1 Gouvêa et al., 2025).
     """
-    n, m = X_raw.shape
-    p = Y_raw.shape[1]
+    n, p = X_raw.shape
+    m = Y_raw.shape[1]
 
-    # 1. Padronização de X e Y
+    # 1. Padronização de X e Y (média zero, variância unitária)
     mu_X = np.mean(X_raw, axis=0)
     std_X = np.std(X_raw, axis=0)
-    std_X[std_X == 0] = 1.0  # Prevenção contra divisão por zero
+    std_X[std_X == 0] = 1.0
 
     mu_Y = np.mean(Y_raw, axis=0)
     std_Y = np.std(Y_raw, axis=0)
@@ -81,37 +86,24 @@ def fit_pilot_analytical(
     X = (X_raw - mu_X) / std_X
     Y = (Y_raw - mu_Y) / std_Y
 
-    # 2. Matrizes Gram e Operador Espectral
-    # S = X^T X com regularização Tikhonov infinitesimal para condicionamento numérico
-    S = X.T @ X + 1e-7 * np.eye(m)
-    norm_X_sq = float(np.sum(X ** 2))
-    norm_Y_sq = float(np.sum(Y ** 2))
+    # 2. Decomposição SVD da matriz empilhada [X | Y]
+    X_bar = np.hstack([X, Y])  # n x (p + m)
+    U, s, Vt = np.linalg.svd(X_bar, full_matrices=False)
 
-    # Operador M combinando reconstrução de X e predição linear de Y
-    term_X = (X.T @ X @ X.T @ X) / norm_X_sq
-    term_Y = (X.T @ Y @ Y.T @ X) / norm_Y_sq
-    M = (1.0 - alpha) * term_X + alpha * term_Y
+    # Coordenadas ideais que sintetizam a covariância conjunta de features e performance
+    Z_star = U[:, :2] * s[:2]
 
-    # 3. Solução Espectral Generalizada: M v = lambda S v
-    eigenvalues, eigenvectors = eigh(M, S)
+    # 3. Solução OLS fechada: A_std = (X^T X)^(-1) X^T Z*
+    A_std = np.linalg.pinv(X) @ Z_star  # p x 2
 
-    # Ordenar pelos maiores autovalores
-    idx = np.argsort(eigenvalues)[::-1]
-    eigenvalues = eigenvalues[idx]
-    eigenvectors = eigenvectors[:, idx]
-
-    # Selecionar os 2 autovetores principais
-    A_std = eigenvectors[:, :2]
-
-    # Coordenadas preliminares padronizadas com variância unitária
+    # Normalizar variância dos eixos projetados
     Z_prelim = X @ A_std
     scale_factor = np.std(Z_prelim, axis=0)
     scale_factor[scale_factor == 0] = 1.0
     A_std = A_std / scale_factor
     Z_std = X @ A_std
 
-    # 4. Otimização de Rotação com N_try = 30 tentativas
-    # Encontra o ângulo theta ótimo para orientar as instâncias mais difíceis rumo ao quadrante superior (+Z1, +Z2)
+    # 4. Rotação ótima (N_try tentativas) para alinhamento de dureza (+Z1, +Z2)
     angles = np.linspace(0, 2 * np.pi, n_try, endpoint=False)
     mean_hardness = np.mean(Y_raw, axis=1)
 
@@ -125,7 +117,6 @@ def fit_pilot_analytical(
             [np.sin(theta),  np.cos(theta)]
         ])
         Z_candidate = Z_std @ R
-        # Alinhamento com a bissetriz do primeiro quadrante (Z1 + Z2) / sqrt(2)
         proj_hardness = (Z_candidate[:, 0] + Z_candidate[:, 1]) / np.sqrt(2)
         corr = float(np.corrcoef(proj_hardness, mean_hardness)[0, 1])
         if corr > best_score:
@@ -133,13 +124,11 @@ def fit_pilot_analytical(
             best_theta = theta
             best_R = R
 
-    # Matriz final de coeficientes padronizados
+    # Matriz final de coeficientes padronizados e coordenadas finais
     A_final = A_std @ best_R
     Z_final = X @ A_final
 
-    # 5. Converter para coeficientes brutos (Eq. 1 de Gouvêa et al., 2025):
-    # Z = X_norm @ A_final = ((X_raw - mu_X) / std_X) @ A_final
-    # Z = X_raw @ A_raw + intercept
+    # 5. Coeficientes brutos para projeção de instâncias externas (Eq. 1 de Gouvêa et al., 2025)
     A_raw = A_final / std_X[:, np.newaxis]
     intercept = - (mu_X / std_X) @ A_final
 
@@ -147,7 +136,6 @@ def fit_pilot_analytical(
     corrs_Z1 = {alg: float(np.corrcoef(Z_final[:, 0], Y_raw[:, j])[0, 1]) for j, alg in enumerate(algorithm_names)}
     corrs_Z2 = {alg: float(np.corrcoef(Z_final[:, 1], Y_raw[:, j])[0, 1]) for j, alg in enumerate(algorithm_names)}
 
-    # Cargas fatoriais (loadings) das features em Z1 e Z2
     loadings = {
         feat: {
             "Z1": float(np.corrcoef(Z_final[:, 0], X_raw[:, j])[0, 1]),
@@ -161,11 +149,12 @@ def fit_pilot_analytical(
     }
 
     metadata = {
-        "alpha": alpha,
+        "method": "MATILDA Canonical SVD + OLS",
         "n_try": n_try,
         "optimal_rotation_deg": float(np.degrees(best_theta)),
         "hardness_alignment_corr": float(best_score),
-        "eigenvalues_top_5": [float(ev) for ev in eigenvalues[:5]],
+        "singular_values_top_5": [float(sv) for sv in s[:5]],
+        "eigenvalues_top_5": [float(sv**2) for sv in s[:5]],
         "feature_means": {f: float(m_val) for f, m_val in zip(feature_names, mu_X)},
         "feature_stds": {f: float(s_val) for f, s_val in zip(feature_names, std_X)},
         "intercept": [float(intercept[0]), float(intercept[1])],
@@ -202,11 +191,12 @@ def generate_pilot_plots(
     cbar1 = fig.colorbar(sc1, ax=ax1, fraction=0.046, pad=0.04)
     cbar1.set_label("Gap Médio ao BKS (Dificuldade Geral)", fontweight="bold")
 
-    # Adicionar rótulos das instâncias
-    for idx, row in df_coords.iterrows():
-        name_short = str(idx).split("_")[0] + "_" + str(idx).split("_")[-1]
-        ax1.annotate(name_short, (row["Z1"], row["Z2"]), fontsize=7.5,
-                     xytext=(4, 4), textcoords="offset points", alpha=0.9)
+    # Adicionar rótulos das instâncias apenas para pequenas bases de teste (<= 12)
+    if len(df_coords) <= 12:
+        for idx, row in df_coords.iterrows():
+            name_short = str(idx).split("_")[0] + "_" + str(idx).split("_")[-1]
+            ax1.annotate(name_short, (row["Z1"], row["Z2"]), fontsize=7.5,
+                         xytext=(4, 4), textcoords="offset points", alpha=0.9)
 
     # Vetores de Carga (Biplot Arrows) das 10 Features
     loadings = metadata["loadings"]
@@ -235,10 +225,11 @@ def generate_pilot_plots(
             ax2.scatter(z1[mask], z2[mask], color=c, label=f"Vencedor: {algo} ({mask.sum()} inst)",
                         s=130, edgecolor="black", zorder=3)
 
-    for idx, row in df_coords.iterrows():
-        name_short = str(idx).split("_")[0] + "_" + str(idx).split("_")[-1]
-        ax2.annotate(name_short, (row["Z1"], row["Z2"]), fontsize=7.5,
-                     xytext=(4, 4), textcoords="offset points", alpha=0.9)
+    if len(df_coords) <= 12:
+        for idx, row in df_coords.iterrows():
+            name_short = str(idx).split("_")[0] + "_" + str(idx).split("_")[-1]
+            ax2.annotate(name_short, (row["Z1"], row["Z2"]), fontsize=7.5,
+                         xytext=(4, 4), textcoords="offset points", alpha=0.9)
 
     ax2.axhline(0, color="gray", linestyle="--", alpha=0.4)
     ax2.axvline(0, color="gray", linestyle="--", alpha=0.4)
@@ -339,7 +330,7 @@ def generate_feature_distribution_maps(
         cbar = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
         cbar.ax.tick_params(labelsize=8)
 
-        if len(df_coords) <= 30:
+        if len(df_coords) <= 12:
             for inst_id, row in df_coords.iterrows():
                 short = str(inst_id).split("_")[0] + "_" + str(inst_id).split("_")[-1]
                 ax.annotate(short, (row["Z1"], row["Z2"]), fontsize=6, alpha=0.7,
@@ -382,7 +373,7 @@ def main() -> None:
         "--performance",
         type=Path,
         default=Path("Y.parquet"),
-        help="Caminho para a matriz de desempenho Y (checkpoint 100%). Padrão: Y.parquet",
+        help="Caminho para a matriz de desempenho Y (checkpoint 100%%). Padrão: Y.parquet",
     )
     parser.add_argument(
         "--alpha",

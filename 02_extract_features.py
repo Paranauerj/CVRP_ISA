@@ -54,7 +54,26 @@ def main() -> int:
     args = parser.parse_args()
 
     t0 = time.perf_counter()
-    paths = sorted(args.instances_dir.glob("*.vrp"))[:args.limit]
+    
+    # Se probing_file existir, alinhar as instâncias a serem extraídas com as instâncias já benchmarkadas
+    target_ids = None
+    prob_p = args.probing_file if args.probing_file.exists() else (Path("outputs") / args.probing_file.name)
+    if prob_p.exists():
+        try:
+            df_p = pd.read_csv(prob_p)
+            if "instancia_id" in df_p.columns:
+                target_ids = set(df_p["instancia_id"].dropna().unique())
+        except Exception:
+            pass
+
+    all_vrps = sorted(args.instances_dir.glob("*.vrp"))
+    if target_ids:
+        paths = [p for p in all_vrps if p.stem in target_ids]
+    else:
+        paths = all_vrps
+    if args.limit:
+        paths = paths[:args.limit]
+
     if not paths:
         print(f"ERRO: Nenhuma instância .vrp encontrada em {args.instances_dir}")
         return 1
@@ -78,24 +97,45 @@ def main() -> int:
     if existing_p:
         df_static = df_static.drop(columns=existing_p)
 
-    if args.probing_file.exists():
-        print(f"Carregando probing features de {args.probing_file}...")
-        df_probing = pd.read_csv(args.probing_file).set_index("instancia_id")
-        p_cols = [c for c in df_probing.columns if c.startswith("P")]
+    df_probing_raw = None
+    prob_p = args.probing_file if args.probing_file.exists() else (Path("outputs") / args.probing_file.name)
+    if prob_p.exists():
+        print(f"Carregando probing features de {prob_p}...")
+        df_probing_raw = pd.read_csv(prob_p).set_index("instancia_id")
+        p_cols = [c for c in df_probing_raw.columns if c.startswith("P")]
         print(f"Colunas de probing detectadas: {p_cols}")
-        df_final = df_static.join(df_probing[p_cols], how="left")
+        df_final = df_static.join(df_probing_raw[p_cols], how="left")
+
+        # --- Normalização Canônica e Invariância de Escala das Probing Features ---
+        s = df_final["_scale_factor"]
+        eff_a = df_final["_effective_area"]
+        n_cust = np.maximum(1.0, df_final["N"])
+
+        # 1. Features lineares de distância escaladas para o grid canônico [0, 1000]
+        for col in ["P2_edge_q25", "P2_edge_q50", "P2_edge_q75", "P3_mean_route_length", "P5_mean_edge_length", "P9_improvement_per_step"]:
+            if col in df_final.columns:
+                df_final[col] = df_final[col] * s
+
+        # 2. Custos globais de tour normalizados pela escala teórica BHH (comprimento de tour ~ sqrt(N * A_real))
+        for col in ["P6_pci_cost", "P7_locmin_cost"]:
+            if col in df_final.columns:
+                df_final[col] = (df_final[col] * s) / np.sqrt(np.maximum(1.0, n_cust * eff_a))
+
+        # 3. Contagens de passos e interseções normalizadas por N clientes
+        for col in ["P1_improving_steps", "P8_intersections", "P10_steps_to_locmin"]:
+            if col in df_final.columns:
+                df_final[col] = df_final[col] / n_cust
     else:
-        # Tenta procurar na pasta outputs/ caso não esteja na raiz
-        fallback_prob = Path("outputs") / args.probing_file.name
-        if fallback_prob.exists():
-            print(f"Carregando probing features de {fallback_prob} (fallback)...")
-            df_probing = pd.read_csv(fallback_prob).set_index("instancia_id")
-            p_cols = [c for c in df_probing.columns if c.startswith("P")]
-            print(f"Colunas de probing detectadas: {p_cols}")
-            df_final = df_static.join(df_probing[p_cols], how="left")
-        else:
-            print(f"AVISO: Arquivo de probing {args.probing_file} não encontrado. F será gravada sem as features P.")
-            df_final = df_static
+        print(f"AVISO: Arquivo de probing {args.probing_file} não encontrado. F será gravada sem as features P.")
+        df_final = df_static
+
+    # Remover colunas auxiliares internas
+    helper_cols = [c for c in ["_scale_factor", "_effective_area"] if c in df_final.columns]
+    if helper_cols:
+        df_final = df_final.drop(columns=helper_cols)
+
+    # Sanitização defensiva contra qualquer NaN ou Inf
+    df_final = df_final.fillna(0.0).replace([np.inf, -np.inf], 0.0)
 
     # Gravar outputs
     args.output.parent.mkdir(parents=True, exist_ok=True)

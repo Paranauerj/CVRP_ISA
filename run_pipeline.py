@@ -39,7 +39,7 @@ if hasattr(sys.stdout, "reconfigure"):
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import KFold, LeaveOneOut, cross_val_score
+from sklearn.model_selection import KFold, LeaveOneOut, StratifiedKFold, cross_val_score
 from sklearn.svm import SVC
 
 
@@ -104,8 +104,8 @@ def evaluate_machine_learning_models(output_dir: Path) -> dict:
             pass
 
     n_samples = len(common_idx)
-    cv = LeaveOneOut() if n_samples <= 30 else KFold(n_splits=5, shuffle=True, random_state=42)
-    cv_desc = "Leave-One-Out (LOO)" if n_samples <= 30 else "5-Fold CV"
+    cv = LeaveOneOut() if n_samples < 20 else StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    cv_desc = "Leave-One-Out (LOO)" if n_samples < 20 else "Stratified 5-Fold CV"
 
     ml_results = {
         "n_samples": n_samples,
@@ -126,14 +126,22 @@ def evaluate_machine_learning_models(output_dir: Path) -> dict:
         n_pos = int(binary_label.sum())
         n_neg = n_samples - n_pos
 
-        svm = SVC(kernel="rbf", C=1.0)
-        svm_acc = float(cross_val_score(svm, df_coords[["Z1", "Z2"]], binary_label, cv=cv).mean())
+        if len(np.unique(binary_label)) < 2 or min(n_pos, n_neg) < 2:
+            majority_acc = float(max(n_pos, n_neg) / n_samples)
+            svm_acc = majority_acc
+            rf_2d_acc = majority_acc
+            rf_fs_acc = majority_acc
+        else:
+            n_splits_eff = min(5, min(n_pos, n_neg))
+            cv_use = LeaveOneOut() if n_samples < 20 else StratifiedKFold(n_splits=n_splits_eff, shuffle=True, random_state=42)
+            svm = SVC(kernel="rbf", C=1.0)
+            svm_acc = float(cross_val_score(svm, df_coords[["Z1", "Z2"]], binary_label, cv=cv_use).mean())
 
-        rf_2d = RandomForestClassifier(n_estimators=50, random_state=42)
-        rf_2d_acc = float(cross_val_score(rf_2d, df_coords[["Z1", "Z2"]], binary_label, cv=cv).mean())
+            rf_2d = RandomForestClassifier(n_estimators=50, random_state=42)
+            rf_2d_acc = float(cross_val_score(rf_2d, df_coords[["Z1", "Z2"]], binary_label, cv=cv_use).mean())
 
-        rf_fs = RandomForestClassifier(n_estimators=50, random_state=42)
-        rf_fs_acc = float(cross_val_score(rf_fs, df_f_sifted, binary_label, cv=cv).mean())
+            rf_fs = RandomForestClassifier(n_estimators=50, random_state=42)
+            rf_fs_acc = float(cross_val_score(rf_fs, df_f_sifted, binary_label, cv=cv_use).mean())
 
         ml_results["footprint_models"][alg] = {
             "good_count": n_pos,
@@ -151,18 +159,66 @@ def evaluate_machine_learning_models(output_dir: Path) -> dict:
     best_algo = df_y.idxmin(axis=1)
     solver_counts = best_algo.value_counts().to_dict()
 
-    svm_best = SVC(kernel="rbf", C=1.0)
-    svm_best_acc = float(cross_val_score(svm_best, df_coords[["Z1", "Z2"]], best_algo, cv=cv).mean())
+    # Mapear vencedores legítimos por instância (com tolerância de empate 1e-6)
+    winners_set = {}
+    for idx, row in df_y.iterrows():
+        min_v = row.min()
+        winners_set[idx] = set(row[abs(row - min_v) <= 1e-6].index)
 
-    rf_best = RandomForestClassifier(n_estimators=50, random_state=42)
-    rf_best_acc = float(cross_val_score(rf_best, df_coords[["Z1", "Z2"]], best_algo, cv=cv).mean())
+    min_class = min(solver_counts.values()) if solver_counts else 0
+    if len(solver_counts) < 2:
+        maj_acc = float(max(solver_counts.values()) / n_samples) if solver_counts else 0.0
+        svm_best_acc = maj_acc
+        svm_tie_acc = maj_acc
+        svm_regret = 0.0
+        rf_best_acc = maj_acc
+        rf_best_fs_acc = maj_acc
+    else:
+        if n_samples < 20:
+            cv_best = LeaveOneOut()
+        elif min_class >= 2:
+            cv_best = StratifiedKFold(n_splits=min(5, min_class), shuffle=True, random_state=42)
+        else:
+            cv_best = KFold(n_splits=5, shuffle=True, random_state=42)
 
-    rf_best_fs = RandomForestClassifier(n_estimators=50, random_state=42)
-    rf_best_fs_acc = float(cross_val_score(rf_best_fs, df_f_sifted, best_algo, cv=cv).mean())
+        # Avaliação de SVM com suporte a desempate neutro e regret
+        X_coords = df_coords[["Z1", "Z2"]].values
+        y_labels = best_algo.values
+        idx_keys = df_coords.index.values
+
+        hits_rigid = 0
+        hits_tie = 0
+        regrets_list = []
+
+        for train_idx, test_idx in cv_best.split(X_coords, y_labels):
+            clf = SVC(kernel="rbf", C=1.0)
+            clf.fit(X_coords[train_idx], y_labels[train_idx])
+            preds = clf.predict(X_coords[test_idx])
+            for p, t_idx in zip(preds, test_idx):
+                inst = idx_keys[t_idx]
+                actual_winners = winners_set[inst]
+                if p == y_labels[t_idx]:
+                    hits_rigid += 1
+                if p in actual_winners:
+                    hits_tie += 1
+                regret_val = float(df_y.loc[inst, p] - df_y.loc[inst].min())
+                regrets_list.append(regret_val)
+
+        svm_best_acc = hits_rigid / n_samples
+        svm_tie_acc = hits_tie / n_samples
+        svm_regret = float(np.mean(regrets_list))
+
+        rf_best = RandomForestClassifier(n_estimators=50, random_state=42)
+        rf_best_acc = float(cross_val_score(rf_best, df_coords[["Z1", "Z2"]], best_algo, cv=cv_best).mean())
+
+        rf_best_fs = RandomForestClassifier(n_estimators=50, random_state=42)
+        rf_best_fs_acc = float(cross_val_score(rf_best_fs, df_f_sifted, best_algo, cv=cv_best).mean())
 
     ml_results["best_selection_model"] = {
         "class_distribution": solver_counts,
-        "svm_2d_accuracy": svm_best_acc,
+        "svm_2d_accuracy_rigid": svm_best_acc,
+        "svm_2d_accuracy_tie_aware": svm_tie_acc,
+        "svm_2d_mean_regret": svm_regret,
         "rf_2d_accuracy": rf_best_acc,
         "rf_sifted_accuracy": rf_best_fs_acc,
     }
@@ -241,7 +297,9 @@ def generate_pipeline_summary(
         "### B. Algoritmo Vencedor (Best Algorithm Selection / AAS)",
         "",
         f"- **Distribuição de Vencedores:** `{best_data.get('class_distribution', {})}`",
-        f"- **Acurácia SVM RBF em (Z1, Z2):** **{best_data.get('svm_2d_accuracy', 0.0)*100:.1f}%**",
+        f"- **Acurácia SVM RBF em (Z1, Z2) (Rígida):** **{best_data.get('svm_2d_accuracy_rigid', best_data.get('svm_2d_accuracy', 0.0))*100:.1f}%**",
+        f"- **Acurácia SVM RBF em (Z1, Z2) (Tie-Aware):** **{best_data.get('svm_2d_accuracy_tie_aware', 0.0)*100:.1f}%**",
+        f"- **Arrependimento Médio SVM (Mean Regret):** **{best_data.get('svm_2d_mean_regret', 0.0)*100:.3f}%**",
         f"- **Acurácia Random Forest em (Z1, Z2):** **{best_data.get('rf_2d_accuracy', 0.0)*100:.1f}%**",
         f"- **Acurácia Random Forest em F_sifted (10 features):** **{best_data.get('rf_sifted_accuracy', 0.0)*100:.1f}%**",
         "",

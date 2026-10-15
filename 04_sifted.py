@@ -101,6 +101,13 @@ def filter_features_by_correlation(
               f"Expandindo para as top {min_features} features mais correlacionadas.")
         filtered = sorted_features[:min_features]
 
+    # Salvaguarda se nenhuma feature tiver correlação válida (ex.: amostra pontual)
+    if not filtered:
+        available = [c for c in df_f.columns if c != "instancia_id"]
+        filtered = available[:min_features]
+        for f in filtered:
+            corr_table.setdefault(f, {"max_abs": 0.0})
+
     return filtered, corr_table
 
 
@@ -121,7 +128,7 @@ def cluster_features(
     # Tratar eventuais NaNs em correlações pontuais
     d_matrix = np.nan_to_num(d_matrix, nan=1.0)
 
-    k_eff = min(k_clusters, len(feature_list))
+    k_eff = max(1, min(k_clusters, len(feature_list)))
     kmeans = KMeans(n_clusters=k_eff, n_init=30, max_iter=300, random_state=random_state)
     labels = kmeans.fit_predict(d_matrix)
 
@@ -301,17 +308,32 @@ def generate_sifted_plots(
                  f"★ {selected_markers[i]}", ha="center", va="bottom", fontsize=7, fontweight="bold", rotation=30)
     ax2.set_ylim(0, max(cluster_sizes) + 2.5)
 
-    # 3. Histograma dos Erros OOB das Combinações Avaliadas (Inferior Esquerdo)
+    # 3. Distribuição / Comparação dos Erros OOB das Combinações Avaliadas (Inferior Esquerdo)
     ax3 = axes[1, 0]
     all_oob_errors = [entry["mean_oob_mse"] for entry in eval_history]
-    ax3.hist(all_oob_errors, bins=min(25, max(5, len(all_oob_errors))), color="#7fcdbb", edgecolor="black", alpha=0.8)
     min_err = min(all_oob_errors)
-    ax3.axvline(min_err, color="red", linestyle="--", linewidth=2.5, label=f"Vencedora: OOB MSE = {min_err:.5f}")
-    ax3.set_title(f"Distribuição do Erro OOB Médio ({len(eval_history)} combinações testadas)", fontweight="bold")
-    ax3.set_xlabel("Erro OOB Médio (MSE)")
-    ax3.set_ylabel("Frequência de Combinações")
-    ax3.grid(True, linestyle="--", alpha=0.5)
-    ax3.legend(loc="upper right", fontsize=9)
+    n_combs = len(eval_history)
+
+    if n_combs <= 6:
+        comb_labels = [f"Comb. {i+1}" for i in range(n_combs)]
+        bar_colors = ["#2ca02c" if abs(err - min_err) < 1e-7 else "#aec7e8" for err in all_oob_errors]
+        b_plots = ax3.bar(comb_labels, all_oob_errors, color=bar_colors, edgecolor="black", width=0.45)
+        for b, err in zip(b_plots, all_oob_errors):
+            ax3.text(b.get_x() + b.get_width() / 2, b.get_height() + 0.001, f"{err:.5f}",
+                     ha="center", va="bottom", fontsize=8.5, fontweight="bold")
+        ax3.set_ylim(0, max(all_oob_errors) * 1.25)
+        ax3.set_title(f"Comparativo de Erro OOB ({n_combs} combinações testadas)", fontweight="bold")
+        ax3.set_ylabel("Erro OOB Médio (MSE)")
+        ax3.axhline(min_err, color="red", linestyle="--", linewidth=1.5, label=f"Vencedora: MSE = {min_err:.5f}")
+        ax3.legend(loc="upper right", fontsize=8.5)
+    else:
+        ax3.hist(all_oob_errors, bins=min(25, max(8, n_combs // 4)), color="#7fcdbb", edgecolor="black", alpha=0.8)
+        ax3.axvline(min_err, color="red", linestyle="--", linewidth=2.5, label=f"Vencedora: OOB MSE = {min_err:.5f}")
+        ax3.set_title(f"Distribuição do Erro OOB Médio ({n_combs} combinações testadas)", fontweight="bold")
+        ax3.set_xlabel("Erro OOB Médio (MSE)")
+        ax3.set_ylabel("Frequência de Combinações")
+        ax3.legend(loc="upper right", fontsize=9)
+    ax3.grid(True, linestyle="--", alpha=0.5, axis="y")
 
     # 4. Desempenho Preditivo da Combinação Vencedora por Algoritmo (Inferior Direito)
     ax4 = axes[1, 1]
@@ -331,12 +353,25 @@ def generate_sifted_plots(
     ax4.set_ylabel("OOB MSE", color="#d73027", fontweight="bold")
     ax4_twin.set_ylabel("OOB R²", color="#1a9850", fontweight="bold")
     ax4.set_title("Acurácia Preditiva da Combinação Selecionada por Algoritmo", fontweight="bold")
-    ax4.grid(True, linestyle="--", alpha=0.5, axis="y")
+    # Juntar legendas com posicionamento superior limpo sem colisão com as barras
+    max_mse = max(mse_vals) if mse_vals else 0.1
+    ax4.set_ylim(0, max_mse * 1.4)
+    min_r2 = min(r2_vals) if r2_vals else -0.1
+    max_r2 = max(r2_vals) if r2_vals else 0.1
+    span_r2 = max(0.1, max_r2 - min_r2)
+    ax4_twin.set_ylim(min_r2 - 0.1 * span_r2, max_r2 + 0.35 * span_r2)
 
-    # Juntar legendas
     lines1, labels1 = ax4.get_legend_handles_labels()
     lines2, labels2 = ax4_twin.get_legend_handles_labels()
-    ax4.legend(lines1 + lines2, labels1 + labels2, loc="upper right", fontsize=9)
+    ax4.legend(
+        lines1 + lines2,
+        labels1 + labels2,
+        loc="upper left",
+        fontsize=8.5,
+        framealpha=0.92,
+        facecolor="white",
+        edgecolor="#cccccc",
+    )
 
     plt.tight_layout()
     output_png.parent.mkdir(parents=True, exist_ok=True)
@@ -363,7 +398,7 @@ def main() -> None:
         "--performance",
         type=Path,
         default=Path("Y.parquet"),
-        help="Caminho para a matriz de desempenho Y (checkpoint 100%). Padrão: Y.parquet",
+        help="Caminho para a matriz de desempenho Y (checkpoint 100%%). Padrão: Y.parquet",
     )
     parser.add_argument(
         "--k-clusters",
@@ -374,8 +409,8 @@ def main() -> None:
     parser.add_argument(
         "--corr-threshold",
         type=float,
-        default=0.5,
-        help="Limiar mínimo de correlação de Pearson |r| com pelo menos um algoritmo. Padrão: 0.5",
+        default=0.3,
+        help="Limiar mínimo de correlação de Pearson |r| com pelo menos um algoritmo (padrão MATILDA: 0.3).",
     )
     parser.add_argument(
         "--max-combinations",
@@ -431,6 +466,11 @@ def main() -> None:
         default=Path("sifted_clusters.png"),
         help="Painel gráfico da etapa SIFTED. Padrão: sifted_clusters.png",
     )
+    parser.add_argument(
+        "--static-only",
+        action="store_true",
+        help="Restringe o SIFTED apenas a características geométricas e estruturais estáticas, excluindo probing (P1-P11).",
+    )
 
     args = parser.parse_args()
 
@@ -481,9 +521,14 @@ def main() -> None:
     df_y = df_y.loc[common_insts]
     print(f" Instâncias analisadas: {len(common_insts)}")
     print(f" Algoritmos em Y     : {list(df_y.columns)}")
+    if args.static_only:
+        p_cols = [c for c in df_f.columns if c.startswith("P")]
+        if p_cols:
+            df_f = df_f.drop(columns=p_cols)
+            print(f" [INFO] Modo --static-only ativado: {len(p_cols)} probing features removidas de F.")
     print(f" Features brutas em F: {df_f.shape[1]}")
 
-    # 3. Passo 1: Filtro de Correlação de Pearson com Y
+    # 3. Passo 1: Filtro de Correlação de Pearson com Y (Canônico MATILDA |r| >= tau)
     filtered_features, corr_table = filter_features_by_correlation(
         df_f, df_y, corr_threshold=args.corr_threshold, min_features=args.k_clusters
     )

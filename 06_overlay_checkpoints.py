@@ -132,9 +132,7 @@ def compute_checkpoint_gaps(
                 "Z2": z2,
                 "bks": bks_val,
             }
-            best_alg = None
-            best_gap = float("inf")
-
+            gaps_dict = {}
             for alg in algorithms:
                 alg_match = cp_df[cp_df["algoritmo"] == alg]
                 if not alg_match.empty:
@@ -142,15 +140,24 @@ def compute_checkpoint_gaps(
                     cost_val = float(alg_match[cost_col].values[0])
                     row[f"{alg}_cost"] = cost_val
                     row[f"{alg}_gap"] = gap_val
-                    if gap_val < best_gap:
-                        best_gap = gap_val
-                        best_alg = alg
+                    if not np.isnan(gap_val):
+                        gaps_dict[alg] = gap_val
                 else:
                     row[f"{alg}_cost"] = np.nan
                     row[f"{alg}_gap"] = np.nan
 
-            row["best_algo"] = best_alg
-            row["best_gap"] = best_gap
+            if gaps_dict:
+                best_gap = min(gaps_dict.values())
+                # Empate numérico com tolerância de 1e-6 (evita viés posicional de argmin para o 1º algoritmo)
+                tied_algs = [alg for alg, g in gaps_dict.items() if abs(g - best_gap) <= 1e-6]
+                if len(tied_algs) > 1:
+                    row["best_algo"] = "Tie"
+                else:
+                    row["best_algo"] = tied_algs[0]
+                row["best_gap"] = best_gap
+            else:
+                row["best_algo"] = None
+                row["best_gap"] = np.nan
             records.append(row)
 
     df_consolidated = pd.DataFrame(records)
@@ -197,11 +204,12 @@ def plot_algorithm_gap_overlays(
 
             sc = ax.scatter(z1, z2, c=gaps, cmap=cmap, norm=norm, s=90, edgecolor="black", alpha=0.9, zorder=3)
 
-            # Rótulos das instâncias nos subplots
-            for _, row in sub.iterrows():
-                short_name = str(row["instancia_id"]).split("_")[0] + "_" + str(row["instancia_id"]).split("_")[-1]
-                ax.annotate(short_name, (row["Z1"], row["Z2"]), fontsize=6, alpha=0.75,
-                            xytext=(3, 3), textcoords="offset points")
+            # Rótulos das instâncias nos subplots (apenas para bases pequenas <= 12)
+            if len(sub) <= 12:
+                for _, row in sub.iterrows():
+                    short_name = str(row["instancia_id"]).split("_")[0] + "_" + str(row["instancia_id"]).split("_")[-1]
+                    ax.annotate(short_name, (row["Z1"], row["Z2"]), fontsize=6, alpha=0.75,
+                                xytext=(3, 3), textcoords="offset points")
 
             ax.axhline(0, color="gray", linestyle=":", alpha=0.3)
             ax.axvline(0, color="gray", linestyle=":", alpha=0.3)
@@ -230,6 +238,29 @@ def plot_algorithm_gap_overlays(
     print(f"[OK] Painel de gaps por algoritmo salvo em: {output_png}")
 
 
+def filter_footprint_outliers(pts: np.ndarray, min_cluster_size: int = 2) -> np.ndarray:
+    """
+    Filtra outliers espaciais isolados no plano (Z1, Z2) antes do Convex Hull,
+    conforme a metodologia de densidade e pureza de Notice et al. (2025).
+    Mantém apenas pontos que possuem vizinhança de suporte da mesma classe.
+    """
+    if len(pts) < 4:
+        return pts
+    from scipy.spatial.distance import pdist, squareform
+    dists = squareform(pdist(pts))
+    dists_sorted = np.sort(dists, axis=1)
+    k_idx = min(min_cluster_size, len(pts) - 1)
+    k_dist = dists_sorted[:, k_idx]
+    med_k = float(np.median(k_dist))
+    if med_k <= 1e-6:
+        return pts
+    threshold = med_k * 2.5
+    inlier_mask = k_dist <= threshold
+    if np.sum(inlier_mask) >= 3:
+        return pts[inlier_mask]
+    return pts
+
+
 def plot_best_selection_evolution(
     df_consolidated: pd.DataFrame,
     checkpoints: list[int],
@@ -253,22 +284,25 @@ def plot_best_selection_evolution(
         "GLS":  "#ff7f0e",  # Laranja
         "ILS":  "#2ca02c",  # Verde
         "TS":   "#d62728",  # Vermelho
+        "Tie":  "#7f7f7f",  # Cinza neutro para empates múltiplos
     }
 
     for c, cp in enumerate(checkpoints):
         ax = axes[c]
         sub = df_consolidated[df_consolidated["checkpoint"] == cp]
 
-        for alg in algorithms:
+        all_cats = list(algorithms) + (["Tie"] if "Tie" in sub["best_algo"].values else [])
+        for alg in all_cats:
             mask = (sub["best_algo"] == alg)
             if np.any(mask):
-                c_color = algo_palette.get(alg, "#9467bd")
+                c_color = algo_palette.get(alg, "#7f7f7f")
                 pts = sub.loc[mask, ["Z1", "Z2"]].values
-                if show_polygons and len(pts) >= 3:
+                pts_hull = filter_footprint_outliers(pts)
+                if show_polygons and alg != "Tie" and len(pts_hull) >= 3:
                     try:
-                        hull = ConvexHull(pts)
+                        hull = ConvexHull(pts_hull)
                         poly = MplPolygon(
-                            pts[hull.vertices],
+                            pts_hull[hull.vertices],
                             facecolor=c_color,
                             edgecolor=c_color,
                             alpha=0.18,
@@ -283,10 +317,11 @@ def plot_best_selection_evolution(
                            color=c_color, label=f"{alg} ({mask.sum()} inst)",
                            s=120, edgecolor="black", zorder=3)
 
-        for _, row in sub.iterrows():
-            short_name = str(row["instancia_id"]).split("_")[0] + "_" + str(row["instancia_id"]).split("_")[-1]
-            ax.annotate(short_name, (row["Z1"], row["Z2"]), fontsize=6.5, alpha=0.8,
-                        xytext=(3, 3), textcoords="offset points")
+        if len(sub) <= 12:
+            for _, row in sub.iterrows():
+                short_name = str(row["instancia_id"]).split("_")[0] + "_" + str(row["instancia_id"]).split("_")[-1]
+                ax.annotate(short_name, (row["Z1"], row["Z2"]), fontsize=6.5, alpha=0.8,
+                            xytext=(3, 3), textcoords="offset points")
 
         ax.axhline(0, color="gray", linestyle=":", alpha=0.3)
         ax.axvline(0, color="gray", linestyle=":", alpha=0.3)
@@ -321,7 +356,7 @@ def plot_summary_dashboard(
     fig.suptitle("Dinâmica Temporal da Busca Local no Espaço de Instâncias (Checkpoints 25% a 100%)",
                  fontsize=14, fontweight="bold")
 
-    algo_palette = {"ALNS": "#1f77b4", "GLS": "#ff7f0e", "ILS": "#2ca02c", "TS": "#d62728"}
+    algo_palette = {"ALNS": "#1f77b4", "GLS": "#ff7f0e", "ILS": "#2ca02c", "TS": "#d62728", "Tie": "#7f7f7f"}
 
     # 1. Convergência Média por Checkpoint (Superior Esquerdo)
     ax1 = axes[0, 0]
@@ -339,11 +374,12 @@ def plot_summary_dashboard(
     ax2 = axes[0, 1]
     n_insts = len(df_consolidated["instancia_id"].unique())
     x = np.arange(len(checkpoints))
-    width = 0.8 / len(algorithms)
-    for i, alg in enumerate(algorithms):
+    all_summary_cats = list(algorithms) + (["Tie"] if "Tie" in df_consolidated["best_algo"].values else [])
+    width = 0.8 / len(all_summary_cats)
+    for i, alg in enumerate(all_summary_cats):
         counts = [(df_consolidated[df_consolidated["checkpoint"] == cp]["best_algo"] == alg).sum() / n_insts * 100 for cp in checkpoints]
         c = algo_palette.get(alg, "gray")
-        ax2.bar(x + (i - len(algorithms) / 2 + 0.5) * width, counts, width, label=alg, color=c, edgecolor="black")
+        ax2.bar(x + (i - len(all_summary_cats) / 2 + 0.5) * width, counts, width, label=alg, color=c, edgecolor="black")
     ax2.set_xticks(x)
     ax2.set_xticklabels([f"{cp}%" for cp in checkpoints], fontweight="bold")
     ax2.set_title("Proporção de Instâncias Dominadas por Checkpoint", fontweight="bold")
@@ -355,16 +391,18 @@ def plot_summary_dashboard(
     # 3. Best Selection Final a 100% (Inferior Esquerdo)
     ax3 = axes[1, 0]
     sub100 = df_consolidated[df_consolidated["checkpoint"] == 100]
-    for alg in algorithms:
+    sub100_cats = list(algorithms) + (["Tie"] if "Tie" in sub100["best_algo"].values else [])
+    for alg in sub100_cats:
         mask = (sub100["best_algo"] == alg)
         if np.any(mask):
             c = algo_palette.get(alg, "gray")
             ax3.scatter(sub100.loc[mask, "Z1"], sub100.loc[mask, "Z2"],
                         color=c, label=f"{alg} ({mask.sum()} inst)", s=120, edgecolor="black", zorder=3)
-    for _, row in sub100.iterrows():
-        short_name = str(row["instancia_id"]).split("_")[0] + "_" + str(row["instancia_id"]).split("_")[-1]
-        ax3.annotate(short_name, (row["Z1"], row["Z2"]), fontsize=6.5, alpha=0.8,
-                     xytext=(3, 3), textcoords="offset points")
+    if len(sub100) <= 12:
+        for _, row in sub100.iterrows():
+            short_name = str(row["instancia_id"]).split("_")[0] + "_" + str(row["instancia_id"]).split("_")[-1]
+            ax3.annotate(short_name, (row["Z1"], row["Z2"]), fontsize=6.5, alpha=0.8,
+                         xytext=(3, 3), textcoords="offset points")
     ax3.set_title("Espaço Final de Instâncias (100% de Tempo) — Best Selection", fontweight="bold")
     ax3.set_xlabel("Coordenada Z1", fontweight="bold")
     ax3.set_ylabel("Coordenada Z2", fontweight="bold")
@@ -381,10 +419,11 @@ def plot_summary_dashboard(
     cbar4 = fig.colorbar(sc4, ax=ax4, fraction=0.046, pad=0.04)
     cbar4.set_label("Redução no Gap (% entre 25% e 100%)", fontweight="bold")
 
-    for _, row in sub100.iterrows():
-        short_name = str(row["instancia_id"]).split("_")[0] + "_" + str(row["instancia_id"]).split("_")[-1]
-        ax4.annotate(short_name, (row["Z1"], row["Z2"]), fontsize=6.5, alpha=0.8,
-                     xytext=(3, 3), textcoords="offset points")
+    if len(sub100) <= 12:
+        for _, row in sub100.iterrows():
+            short_name = str(row["instancia_id"]).split("_")[0] + "_" + str(row["instancia_id"]).split("_")[-1]
+            ax4.annotate(short_name, (row["Z1"], row["Z2"]), fontsize=6.5, alpha=0.8,
+                         xytext=(3, 3), textcoords="offset points")
     ax4.set_title("Melhoria de Qualidade ao Estender o Tempo (Delta Gap)", fontweight="bold")
     ax4.set_xlabel("Coordenada Z1", fontweight="bold")
     ax4.set_ylabel("Coordenada Z2", fontweight="bold")
@@ -446,6 +485,9 @@ def generate_params_log(
 ## 2. Extração de Características e Probing (Etapa 4)
 
 - **Total de Características Extraídas:** 63 features brutas
+- **Invariância de Escala e Grid Canônico (Notice et al., 2025, p. 4):**
+  - Coordenadas espaciais normalizadas para grid $[0, 1000] \\times [0, 1000]$ preservando a proporção de aspecto espacial.
+  - Todas as métricas extensivas (ND2, MST1_sum, MST3, NN2, NN3) convertidas em taxas e médias relativas a N.
 - **Famílias Estruturais:**
   1. **ND (Distribuição de Nós):** 9 sub-features (distâncias médias, medianas, clusters DBSCAN)
   2. **MST (Árvore Geradora Mínima):** 3 sub-features (grau de nós, custos de arestas)
@@ -537,12 +579,13 @@ def compute_footprint_metrics(
             Z_good = sub_cp.loc[good_mask, ["Z1", "Z2"]].values
             good_ids = set(sub_cp.loc[good_mask, "instancia_id"])
 
-            if len(Z_good) >= 3:
+            Z_good_hull = filter_footprint_outliers(Z_good)
+            if len(Z_good_hull) >= 3:
                 try:
-                    hull_good = ConvexHull(Z_good)
+                    hull_good = ConvexHull(Z_good_hull)
                     area_good = float(hull_good.volume)
                     norm_area_good = area_good / area_space
-                    path_good = MplPath(Z_good[hull_good.vertices])
+                    path_good = MplPath(Z_good_hull[hull_good.vertices])
                     inside_mask = path_good.contains_points(Z_all)
                     n_inside_total = int(np.sum(inside_mask))
                     inside_good = sum(
@@ -570,12 +613,13 @@ def compute_footprint_metrics(
             Z_best = sub_cp.loc[best_mask, ["Z1", "Z2"]].values
             best_ids = set(sub_cp.loc[best_mask, "instancia_id"])
 
-            if len(Z_best) >= 3:
+            Z_best_hull = filter_footprint_outliers(Z_best)
+            if len(Z_best_hull) >= 3:
                 try:
-                    hull_best = ConvexHull(Z_best)
+                    hull_best = ConvexHull(Z_best_hull)
                     area_best = float(hull_best.volume)
                     norm_area_best = area_best / area_space
-                    path_best = MplPath(Z_best[hull_best.vertices])
+                    path_best = MplPath(Z_best_hull[hull_best.vertices])
                     inside_mask = path_best.contains_points(Z_all)
                     n_inside_total = int(np.sum(inside_mask))
                     inside_best = sum(
@@ -710,7 +754,7 @@ def main() -> None:
         "--epsilon",
         type=float,
         default=0.05,
-        help="Tolerância de gap para Good Performance no Footprint (padrão: 0.05 = 5%)",
+        help="Tolerância de gap para Good Performance no Footprint (padrão: 0.05 = 5%%)",
     )
 
     args = parser.parse_args()

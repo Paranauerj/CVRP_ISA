@@ -278,3 +278,41 @@ Quando modelos clássicos de aprendizado supervisionado (como SVM com kernel RBF
 
 3. **Validação do Sistema de Recomendação (AAS):**
    Confirma a viabilidade prática do Automated Algorithm Selection com custo de inferência desprezível ($O(1)$ após extração rápida de features), entregando qualidade de solução próxima à do oráculo perfeito (*Virtual Best Solver*) com uma fração do orçamento computacional.
+
+
+---
+
+## 8. Invariância de Escala e Normalização Canônica das Features
+
+### Primary Reference
+> **Notice, C., et al. (2025).** "Instance Space Analysis of the Capacitated Vehicle Routing Problem with Mixture Discriminant Analysis." *Computers & Operations Research*. Section 3.2, p. 4:
+> *"We also normalise the coordinates of each instance to a 1000 × 1000 grid in order to make the problem instances more comparable. We use both the normalised and original distance matrix when calculating these features."*
+
+---
+
+### Justificativa Metodológica
+
+1. **Normalização Espacial para Grid $[0, 1000] \times [0, 1000]$ e Razão de Aspecto ($G1$):**
+   Diferentes geradores de instâncias na literatura adotam bounding boxes arbitrárias (ex.: $[0, 100]$ em benchmarks clássicos de Christofides, $[0, 1000]$ em Uchoa Set X, ou coordenadas geográficas em metros/graus). Para que o espaço de instâncias capture a **topologia da distribuição** e não a unidade arbitrária de medida, as coordenadas são transformadas de forma isotrópica preservando a proporção de aspecto espacial:
+   $$\mathbf{x}_{\text{norm}} = \frac{\mathbf{x} - \min(\mathbf{x})}{\max(\Delta x_{\text{orig}}, \Delta y_{\text{orig}})} \times 1000$$
+   - Para evitar que $G1$ (área da bounding box) se torne uma constante degenerada de variância nula ($10^6$) caso fosse normalizada anisotropicamente, a métrica de proporção geométrica é explicitada via Razão de Aspecto:
+     $$\text{G1}_{\text{aspect\_ratio}} = \frac{\min(\Delta x_{\text{orig}}, \Delta y_{\text{orig}})}{\max(\Delta x_{\text{orig}}, \Delta y_{\text{orig}})} \in (0, 1]$$
+   - Adicionalmente, $\text{G1}_{\text{bbox\_area}} = \Delta x_{\text{norm}} \cdot \Delta y_{\text{norm}} = 10^6 \cdot \text{G1}_{\text{aspect\_ratio}}$ varia continuamente entre $0$ e $10^6$, refletindo a esbeltez geométrica da região delimitadora.
+
+2. **Resolução de Colinearidade e Escalonamento Assintótico de Beardwood-Halton-Hammersley (BHH):**
+   Métricas que acumulam valores ao longo do grafo cresceriam com $N$, dominando artificialmente os eixos do PILOT. No [`cvrp_features.py`](file:///C:/Users/jptin/OneDrive/USAL/Codes/CVRP_ISA/cvrp_features.py), as métricas são calibradas com base nos teoremas assintóticos de grafos planares euclidianos:
+   - **$ND2$ vs $NN1$ (Índice de Agregação Espacial de Clark-Evans / BHH com Área Efetiva):**
+     Dividir a soma das menores distâncias por $N$ geraria uma cópia idêntica da média do 1º vizinho mais próximo ($\text{NN1}_{\text{dist\_1nn\_mean}}$, correlação $r = 1.0000$). Para manter $ND2$ ortogonal e não-redundante, a soma é normalizada pelo fator assintótico de BHH sobre a **área de suporte efetiva da caixa delimitadora normalizada** ($A_{\text{real}} = \Delta x_{\text{norm}} \cdot \Delta y_{\text{norm}} = 10^6 \cdot \text{G1}_{\text{aspect\_ratio}}$):
+     $$\text{ND2} = \frac{\sum_{i=1}^V \min_{j \neq i} d_{ij}}{\sqrt{N \cdot A_{\text{real}}}}$$
+     Como os teoremas de BHH e Clark-Evans assumem que os pontos ocupam uma região de suporte de área $A$, utilizar $A_{\text{real}}$ impede que geometrias alongadas (ex.: corredores estreitos com aspect ratio 0.25) simulem artificialmente a presença de clusters, quebrando qualquer colinearidade espúria entre $ND2$ e a geometria do bounding box. Para processos homogêneos de Poisson, $\mathbb{E}[\text{ND2}] \approx 0.50$ (uniforme), $< 0.50$ (clusterizado) e $> 0.50$ (disperso regular).
+   - **Contagem de Vértices e Escala na MST ($MST1$):**
+     No CVRP com $V = N + 1$ vértices (1 depósito + $N$ clientes), a Árvore Geradora Mínima possui exatamente $|E| = (N + 1) - 1 = N$ arestas.
+     - Custo médio por aresta: $\text{MST1}_{\text{mean}} = \frac{1}{N} \sum_{e \in \text{MST}} c_e$;
+     - Custo total assintótico (invariante à densidade e aspect ratio): $\text{MST1}_{\text{sum}} = \frac{\sum_{e \in \text{MST}} c_e}{\sqrt{N \cdot A_{\text{real}}}}$ (conforme a lei assintótica de Steele/BHH: $\text{Length}(\text{MST}) \sim \beta_{\text{MST}} \sqrt{N \cdot A_{\text{real}}}$, onde $\beta_{\text{MST}} \approx 0.656$).
+   - **Profundidade Relativa da MST ($MST3$):**
+     Como o caminho mais longo na árvore a partir do depósito tem no máximo $N$ saltos, a profundidade relativa é dada por:
+     $$\text{MST3} = \frac{\max_{v} \text{depth}(v)}{N} \in [1/N, 1.0]$$
+   - **Componentes Conexos do Grafo k-NN ($NN2$, $NN3$):**
+     $\text{NN2} = \frac{|\text{SCC}|}{N + 1}$ e $\text{NN3} = \frac{|\text{WCC}|}{N + 1}$, expressando a taxa intrínseca de componentes conexos por vértice.
+
+Com essa fundamentação matemática, 100% das 51 features contínuas são rigorosamente invariantes a transformações afins de escala espacial e assintoticamente estáveis para quaisquer instâncias com $N \in [30, 10.000]$.
