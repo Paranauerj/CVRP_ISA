@@ -121,11 +121,12 @@ O PRELIM normaliza colunas entre instâncias (Min-Max/Box-Cox), mas não remove 
    span = np.maximum(max_c - min_c, 1e-6)
    norm_coords = ((coords - min_c) / span) * 1000.0
    ```
-2. **Normalização de Features Extensivas por $N$:**
-   - `ND2_min_edge_sum`: Dividir por $N$ (custo médio da aresta mínima por vértice) **e** gerar variante normalizada por $\sqrt{N}$ (invariante à densidade assintótica de pontos no plano, evitando colinearidade exata com `NN1_mean`).
+2. **Normalização de Features Extensivas por $N$ e Prevenção de Colinearidade Perfeita ($|r| = 1{,}0$ / Multicolinearidade):**
+   - `ND2_min_edge_sum`: Dividir por $N$ (custo médio da aresta mínima por vértice) **e** gerar variante normalizada por $\sqrt{N}$ (lei assintótica de Beardwood-Halton-Hammersley para pontos no plano 2D, evitando colinearidade exata $|r|=1{,}0$ com `NN1_dist_mean`).
    - `MST1_edge_cost_sum`: Dividir por $N$ (como o grafo CVRP possui $N$ clientes + 1 depósito = $N+1$ vértices, a MST possui exatamente $N$ arestas; dividir por $N$ fornece o custo médio de aresta da MST).
    - `MST3_tree_depth`: Dividir por $N$ $\implies$ profundidade relativa da árvore em $[0, 1]$.
-   - `G1_bounding_box`: Como `norm_coords` fixa a caixa em $1000 \times 1000$, extrair a **razão de aspecto** ($\text{span}_x / \text{span}_y$) das coordenadas originais em vez da área bruta pós-escalonamento.
+   - `G1_bounding_box`: Como `norm_coords` fixa a caixa em $1000 \times 1000$ (área constante $10^6$), extrair a **razão de aspecto** ($\text{span}_x / \text{span}_y$) das coordenadas originais em vez da área bruta pós-escalonamento.
+   - **Exclusão de invariantes algébricos de grafos (variância zero / dependência determinística):** omitidas a média do grau da MST (`MST2_degree_mean`, identicamente $2N/(N+1)$ para qualquer árvore) e a média do grau de entrada no grafo $k$-NN direcionado (`NN6_in_degree_mean`, identicamente $k=3{,}0$ pelo Lema do Aperto de Mãos). Combinado ao agrupamento ortogonal do SIFTED ($K=10$ sobre $1 - |r_{i,j}|$), isso garante que a matriz $F_{\text{sifted}}$ tenha **posto completo (*full rank*)** e **baixo Fator de Inflação de Variância ($\text{VIF} \approx 1{,}3\text{–}5{,}4 < 10$)**, eliminando multicolinearidade na projeção analítica do PILOT.
 
 ### 4.2 Catálogo de Features (6 Categorias)
 
