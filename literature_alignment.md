@@ -126,15 +126,24 @@ The ALNS framework iteratively destroys part of a solution and repairs it. Weigh
 
 ---
 
-## 5. TS — Tabu Search
+## 5. HGS — Hybrid Genetic Search (HGS-CVRP)
+
+> [!NOTE]
+> Replaces the former TS (Tabu Search, OR-Tools), which was **removed** from the portfolio.
 
 ### Primary Reference
-> **Glover, F. (1989).** "Tabu Search — Part I." *ORSA Journal on Computing*, 1(3), 190–206.
+> **Vidal, T. (2022).** "Hybrid Genetic Search for the CVRP: Open-Source Implementation and SWAP\* Neighborhood." *Computers & Operations Research*, 140, 105643.
 
-### Key Idea (from the paper)
-> *"Tabu search uses a flexible memory structure... Recently visited solutions (or solution attributes) are classified as 'tabu', preventing the search from revisiting them for a certain number of iterations."* — Glover (1989, p. 190)
+### Key Idea
+Population-based metaheuristic: giant-tour crossover (OX) + education by local search (granular neighborhoods incl. SWAP\*) + penalised infeasible solutions + diversity-aware survivor selection (biased fitness).
 
-**OR-Tools implementation:** Short-term memory via LocalSearchMetaheuristic.TABU_SEARCH. Moves that recently worsened the objective are forbidden (tabu-active) for a configurable tenure.
+**Implementation:** `pyvrp.GeneticAlgorithm` (PyVRP 0.11.3; SREX crossover, SWAP\* local search, adaptive penalties, biased-fitness diversity management), default PyVRP parameters, time-only stopping, `round_func="round"` (EUC_2D `nint`, same metric as the BKS).
+
+**Protocol alignment:**
+1. The initial population is **seeded with the PCI solution** (plus `min_pop_size − 1` random solutions for diversity) → same starting point as ALNS/ILS/GLS.
+2. The real incumbent history is captured by an instrumented stopping criterion → checkpoints (25/50/75/100%) come from a **single run** per job.
+3. The BKS are produced by the original C++ HGS-CVRP (3 × 10 min); HGS-PyVRP is a close reimplementation of the same algorithm family → HGS gaps are measured against a longer run of a very similar algorithm (circularity to be declared in the paper).
+4. `hygese` (wrapper of the C++ HGS-CVRP) was evaluated and discarded: no initial solution, no incumbent history.
 
 ---
 
@@ -142,20 +151,22 @@ The ALNS framework iteratively destroys part of a solution and repairs it. Weigh
 
 | Work | Contribution | Used In |
 |---|---|---|
-| Vidal, T. (2022). "Hybrid genetic search for the CVRP." Computers & Operations Research, 140. | SwapStar operator — C++ implementation in PyVRP | ALNS, ALNS2, ILS (polishing) |
+| Vidal, T. (2022). "Hybrid genetic search for the CVRP." Computers & Operations Research, 140. | SwapStar operator — C++ implementation in PyVRP; HGS algorithm itself (PyVRP `GeneticAlgorithm`) | ALNS, ALNS2, ILS (polishing); HGS (portfolio member) |
 | Christiaens, J., & Vanden Berghe, G. (2020). "Slack Induction by String Removals for Vehicle Routing Problems." Transportation Science, 54(2). | SISR — String Removal destroy operator | ALNS, ALNS2 |
 | Dueck, G. (1993). "New Optimization Heuristics." Journal of Computational Physics, 104(1). | Record-to-Record Travel acceptance criterion | ALNS |
 | Shaw, P. (1998). "Using Constraint Programming and Local Search Methods to Solve Vehicle Routing Problems." In CP-98, Springer. | Relatedness-based removal (Shaw Removal) | ALNS, ALNS2 |
 
 ---
 
-## 7. Parallel Cheapest Insertion (PCI) — Common Constructor
+## 7. Parallel Cheapest Insertion (PCI) & Shared PyVRP C++ Local Search — Dual Experimental Control
 
-> **Reference:** Standard constructive heuristic; attributed to Clarke-Wright savings framework variants.
+> **Reference:** Standard constructive heuristic; attributed to Clarke-Wright savings framework variants, coupled with `pyvrp.search.LocalSearch` (Vidal, 2022).
 
-**Role in the ISA:** All three algorithm families (ALNS, ILS, GLS/TS) start from the **same PCI solution**. This isolates the effect of the search layer from the construction layer, as required by the ISA execution plan.
+**Role in the ISA:**
+- **Level 1 Control (Construction):** All four algorithms (`ALNS`, `ILS`, `GLS`, `HGS`) start from the **same PCI solution** (in `HGS` it seeds the initial population).
+- **Level 2 Control (Intensification):** `ALNS`, `ILS`, and `HGS` share the **same C++ local search engine** (`create_pyvrp_local_search`, 13 operators + `SWAP*`). Consequently, any performance difference among `ALNS`, `ILS`, and `HGS` in the instance space is **100% attributable to the high-level metaheuristic control paradigm** (population + SREX crossover vs. single-trajectory perturbation vs. large-neighborhood destroy/repair + SA), and the probing features (`P1`–`P11`) extracted during the initial local descent of `ILS` directly measure the geometry of the attraction basin shared by all three PyVRP-backed solvers (yielding $|r| > 0.90$ correlation with `HGS` performance).
 
-> *"The common constructive heuristic ensures that differences in final solution quality are attributable to the search strategy, not to lucky initialisation."* — ISA execution plan (instructions.md)
+> *"The common constructive heuristic and shared C++ local search engine ensure that differences in final solution quality are attributable to the high-level search strategy, not to lucky initialisation or asymmetric neighbourhood operators."* — ISA execution plan ([instructions.md](file:///C:/Users/jptin/OneDrive/USAL/Codes/CVRP_ISA/instructions.md))
 
 ---
 
@@ -254,14 +265,14 @@ In this CVRP ISA pipeline (Step 5, PRELIM):
 Na metodologia canônica do MATILDA e nos estudos avançados de CVRP (Notice et al., 2025; Gouvêa et al., 2025), o aprendizado de máquina é empregado em duas frentes complementares:
 
 #### Tarefa A: Previsão de Footprint (Classificação Binária por Algoritmo)
-- **Objetivo:** Para um algoritmo específico $A \in \{\text{ALNS}, \text{ILS}, \text{GLS}, \text{TS}\}$, predizer se ele alcançará "Good Performance" na instância $x$ ($Y_A(x) \le \varepsilon$, onde $\varepsilon$ é o limiar canônico mediano do PRELIM).
+- **Objetivo:** Para um algoritmo específico $A \in \{\text{ALNS}, \text{ILS}, \text{GLS}, \text{HGS}\}$, predizer se ele alcançará "Good Performance" na instância $x$ ($Y_A(x) \le \varepsilon$, onde $\varepsilon$ é o limiar canônico mediano do PRELIM).
 - **Rótulo ($y$):** Binário ($1$ se $Y_A \le \varepsilon$, $0$ se $Y_A > \varepsilon$).
 - **Finalidade:** Delimitar as fronteiras geométricas do nicho de dominância contínuo (*footprint*) de cada solver no espaço bidimensional.
 
 #### Tarefa B: Seleção do Melhor Algoritmo (*Best Algorithm Selection* / AAS — Multi-classe)
 - **Objetivo:** Dentre todos os algoritmos do portfólio, predizer diretamente qual deles encontrará a solução com o menor custo na instância $x$:
   $$A^*(x) = \arg\min_{A \in \mathcal{A}} \text{Cost}(A, x)$$
-- **Rótulo ($y$):** Categórico ($\text{ALNS}, \text{ILS}, \text{GLS}, \text{TS}$).
+- **Rótulo ($y$):** Categórico ($\text{ALNS}, \text{ILS}, \text{GLS}, \text{HGS}$).
 - **Finalidade Operacional:** Permitir que, diante de uma instância nova e desconhecida, o praticante ou sistema automatizado selecione a meta-heurística ideal com base apenas em suas características projetadas $(Z_1, Z_2)$, evitando o custo computacional proibitivo de executar todo o portfólio.
 
 ---

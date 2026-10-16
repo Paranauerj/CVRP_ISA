@@ -270,7 +270,7 @@ def generate_pipeline_summary(
         "### Fundamentação Teórica e Significado Científico no ISA",
         "Na metodologia canônica de Instance Space Analysis (*Smith-Miles & Muñoz, 2023*; *Notice et al., 2025*; *Gouvêa et al., 2025*), avaliam-se duas tarefas essenciais de Aprendizado de Máquina:",
         "1. **Previsão de Footprint (Classificação Binária):** Para cada algoritmo individual, prevê se ele apresentará bom desempenho ($Y \\le \\varepsilon$) com base nas características da instância.",
-        "2. **Seleção do Melhor Algoritmo (*Best Algorithm Selection* / AAS — Multi-classe):** Prevê diretamente qual meta-heurística (ALNS, ILS, GLS, TS) produzirá o menor custo para a instância.",
+        "2. **Seleção do Melhor Algoritmo (*Best Algorithm Selection* / AAS — Multi-classe):** Prevê diretamente qual meta-heurística (ALNS, ILS, GLS, HGS) produzirá o menor custo para a instância.",
         "",
         "Quando os classificadores (especialmente o SVM RBF) atingem alta acurácia usando **exclusivamente as duas coordenadas projetadas $(Z_1, Z_2)$**, isso fornece três comprovações científicas centrais:",
         "- **Preservação de Informação:** O espaço 2D construído analiticamente pelo PILOT não perdeu a informação discriminatória contida nas características originais.",
@@ -378,8 +378,8 @@ def main() -> int:
                         help="retoma etapas a partir de resultados intermediários existentes (default: True)")
 
     # Parâmetros de Benchmark (Etapa 1)
-    parser.add_argument("--algorithms", nargs="+", default=["ALNS", "ILS", "GLS", "TS"],
-                        help="Algoritmos a comparar (padrão: ALNS ILS GLS TS)")
+    parser.add_argument("--algorithms", nargs="+", default=["ALNS", "ILS", "GLS", "HGS"],
+                        help="Algoritmos a comparar (padrão: ALNS ILS GLS HGS)")
     parser.add_argument("--seeds", nargs="+", type=int, default=[1001, 2001, 3001],
                         help="Sementes pseudoaleatórias (padrão: 1001 2001 3001)")
     parser.add_argument("--workers", type=int, default=4,

@@ -1,5 +1,5 @@
 # Guia de Execução da Fase 2 no Servidor Linux (SSH Fire-and-Forget)
-## 4 Solvers (ALNS, ILS, GLS, TS) | 8 Workers | Probing Features (P1–P11)
+## 4 Solvers (ALNS, ILS, GLS, HGS) | 8 Workers | Probing Features (P1–P11)
 
 ---
 
@@ -7,9 +7,10 @@
 
 ### 1.1 Parâmetros Selecionados
 - **Dataset:** 10.000 instâncias Gaetano ($N \in [30, 200]$, média $\bar{N} \approx 113,25$ clientes)
-- **Solvers:** **4 metaheurísticas** (`ALNS`, `ILS`, `GLS`, `TS`)
-  - **TS incluído:** Fornece memória explícita de curto prazo (Glover, 1989), vencedor comprovado em instâncias densas como `X-n101-k25` (gap de **1.67%**) e `LDG185` (gap de **15.55%**).
+- **Solvers:** **4 metaheurísticas** (`ALNS`, `ILS`, `GLS`, `HGS`)
+  - **HGS incluído (substitui o TS, removido):** HGS na implementação do PyVRP (`GeneticAlgorithm`), defaults, semeado com a solução PCI e com incumbente temporal real (1 execução por job, custo ≈ T(N)) — ver `instructions.md` §2.
 - **Construtiva comum:** **PCI** (Parallel Cheapest Insertion) fixa para todos os solvers.
+- **Resiliência:** o orquestrador recria o pool de processos se um worker morrer (OOM/segfault) e reexecuta só os jobs pendentes (ver `01_run_algorithms.py`).
 - **Orçamento de tempo:** $T(N) = \min(0.5 \times N,\ 100\text{ s})$ (coerência com o artigo de AAS do autor).
 - **Seeds:** 3 (`1001`, `2001`, `3001`) $\implies$ $10.000 \times 4 \times 3 = \mathbf{120.000\text{ runs}}$.
 - **Checkpoints:** 25%, 50%, 75%, 100% de $T(N)$.
@@ -20,7 +21,7 @@
 
 ### 1.2 Tempo Estimado com 8 Workers
 
-- **Tempo total de CPU acumulado:** $\approx 1.887,5\text{ horas}$ (~78,6 CPU-dias).
+- **Tempo total de CPU acumulado:** $\approx 1.887,5\text{ horas}$ (~78,6 CPU-dias); o HGS-PyVRP consome ≈ $1\times T(N)$ por job, igual ao TS que substituiu.
 - **Tempo real de relógio (Wall-clock) com 8 workers (~80% de eficiência paralela):**
   $$\text{Tempo real} \approx \frac{1.887,5\text{ h}}{8 \times 0.80} \approx \mathbf{295\text{ horas}} \approx \mathbf{11,8\text{ a 12 dias}}$$
 
@@ -79,7 +80,7 @@ source venv/bin/activate
 
 nohup python3 01_run_algorithms.py \
   --instances-dir "../../joao/instances/gaetano" \
-  --algorithms ALNS ILS GLS TS \
+  --algorithms ALNS ILS GLS HGS \
   --seeds 1001 2001 3001 \
   --workers 8 \
   --seconds-per-customer 0.5 \

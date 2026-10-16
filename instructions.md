@@ -28,7 +28,7 @@ Este plano é uma especificação técnica para um agente de codificação **esc
 
 ## 2. Algoritmos a comparar (geração de $Y$ e das probing features)
 
-O estudo avalia um portfólio de **4 metaheurísticas de trajetória**, **todas inicializadas com a mesma heurística construtiva: PCI (Parallel Cheapest Insertion)**:
+O estudo avalia um portfólio de **4 metaheurísticas** — três de trajetória (ALNS, ILS, GLS) e uma populacional estado-da-arte (HGS), **todas inicializadas com a mesma heurística construtiva: PCI (Parallel Cheapest Insertion)** (no HGS, o PCI semeia a população inicial):
 
 1. **ALNS** (Adaptive Large Neighborhood Search):
    - Versão canônica com critério de aceitação por **Simulated Annealing** (Ropke & Pisinger, 2006), parametrizado via `SimulatedAnnealing.autofit(worse=0.05, accept_prob=0.5)` e biblioteca `alns 7.0.0`.
@@ -47,16 +47,25 @@ O estudo avalia um portfólio de **4 metaheurísticas de trajetória**, **todas 
    - LNS dinâmico: $\text{LNS}(N, \bar{L}_{route}) = \text{clamp}(60, 250, \text{int}(40 + 0.8 N + 8 \bar{L}_{route}))\text{ ms}$.
    - Operadores ativos: `use_cross_exchange=True`, `use_tsp_opt=True`, `use_relocate_neighbors=True`, `use_full_path_lns=False`.
 
-4. **TS** (Tabu Search, via OR-Tools):
-   - Metaheurística baseada em memória explícita de curto prazo (Glover, 1989), proibindo arcos recentemente modificados para forçar diversificação contínua.
-   - Fornece complementaridade ao portfólio no espaço de instâncias (especialmente em instâncias de alta densidade e rotas curtas).
+4. **HGS** (Hybrid Genetic Search — Vidal, 2022, implementação do **PyVRP**: `pyvrp.GeneticAlgorithm`):
+   - Algoritmo populacional (crossover SREX + busca local com SWAP* + penalidades adaptativas + gestão de diversidade), com os **parâmetros default do PyVRP**. Critério de parada apenas por tempo.
+   - **Partida a partir do PCI:** a população inicial é semeada com a solução PCI (a mesma de ALNS/ILS/GLS) acrescida de `min_pop_size − 1` soluções aleatórias (necessárias à diversidade genética inicial). Assim, o controle experimental "mesma construtiva" vale para os 4 algoritmos.
+   - **Incumbente temporal real:** um critério de parada instrumentado registra o melhor custo viável a cada iteração, de modo que os checkpoints saem de **uma única execução** por job (custo ≈ 1 × T(N)).
+   - Mesma métrica do BKS (`EUC_2D` com `round_func="round"`), custo final recalculado a partir da matriz de distâncias.
+   - Substitui o antigo Tabu Search (TS, OR-Tools), **removido do portfólio**. A tentativa intermediária com `hygese` (HGS-CVRP em C++) foi descartada por não aceitar solução inicial nem expor o incumbente temporal.
+   - *Nota de circularidade:* o BKS é gerado pelo HGS-CVRP original (C++, 3 × 10 min). O HGS-PyVRP é a mesma família algorítmica (reimplementação), de modo que seu gap é medido contra uma execução longa de um algoritmo muito próximo; tende a ser o menor do portfólio. Documentar no artigo.
 
 ### 2.1 Justificativa Metodológica do Portfólio (Texto base para o Artigo)
 
-> **Enquadramento para a seção de Metodologia do artigo:**
-> *"Diferentemente de estudos de competição voltados a identificar o solver estado-da-arte absoluto (como Gouvêa et al., 2025, com os finalistas do DIMACS, ou Notice et al., 2025, comparando HGS e FILO), este estudo investiga como diferentes **mecanismos clássicos de controle de trajetória em busca local** interagem com a estrutura das instâncias ao longo do orçamento de tempo. Para isolar o efeito do paradigma de diversificação/intensificação, fixamos a solução inicial utilizando a mesma heurística construtiva (Parallel Cheapest Insertion — PCI) em todos os métodos e avaliamos quatro arquiteturas canônicas de trajetória única: (i) destruição e reconstrução em larga escala com aceitação estocástica por Simulated Annealing (ALNS); (ii) perturbação estrutural com critério de aceitação elitista de descida pura (ILS); (iii) modificação dinâmica da função objetivo por penalização de atributos (GLS); e (iv) restrição determinística de movimentos via memória de curto prazo (TS). Esse desenho controlado permite mapear, no espaço de instâncias, sob quais condições topológicas e em qual fração do orçamento de tempo cada estratégia de escape de ótimos locais supera as demais, fornecendo a base analítica para sistemas de Seleção Automática de Algoritmos (AAS) baseados em portfólios de trajetória."*
+> **Enquadramento para a seção de Metodologia do artigo (Duplo Isolamento Experimental):**
+> *"Diferentemente de estudos de competição voltados a comparar pacotes fechados em C++ como caixas-pretas (como Gouvêa et al., 2025, com os finalistas do DIMACS, ou Notice et al., 2025, comparando HGS e FILO — onde a heurística construtiva, as estruturas de vizinhança e a linguagem de implementação variam simultaneamente entre os competidores), este estudo propõe um **desenho experimental duplamente controlado** para investigar como diferentes **paradigmas de controle de busca (trajetória vs. populacional)** interagem com a topologia das instâncias ao longo do orçamento de tempo:*
+> 1. * **Isolamento da Construção Inicial:** Todos os quatro métodos partem exatamente da mesma solução inicial gerada pela heurística construtiva Parallel Cheapest Insertion (PCI).*
+> 2. * **Isolamento do Motor de Busca Local (Intensificação):** Três dos algoritmos — **ALNS** (destruição/reconstrução em larga escala com aceitação por Simulated Annealing), **ILS** (perturbação estrutural com aceitação elitista de descida pura) e **HGS** (evolução populacional com crossover SREX e gestão de diversidade de pares quebrados) — delegam toda a fase de melhoria intra e inter-rotas para **exatamente o mesmo motor C++ de busca local (`pyvrp.search.LocalSearch`, com os mesmos 13 operadores de nó e rota, incluindo `SWAP*`)**, complementados pelo **GLS** (modificação dinâmica da paisagem de busca por penalização de atributos via Google OR-Tools).*
+> *Esse acoplamento controlado garante que qualquer divergência de desempenho entre ALNS, ILS e HGS no espaço de instâncias seja atribuível **100% ao mecanismo de controle de alto nível (metaheurística)**, e não a diferenças de solução inicial ou de implementação dos operadores de vizinhança. Adicionalmente, como ALNS, ILS e HGS compartilham a mesma bacia de atração do motor de busca local do PyVRP, as **probing features (P1–P11)** extraídas na primeira descida local do ILS capturam a geometria exata do vale de busca que governa tanto os métodos de trajetória quanto a educação da população do HGS (apresentando correlação $|r| > 0{,}90$ com o desempenho final do próprio HGS)."*
 
-- **Nota técnica sobre implementação e busca local (a documentar em `params_log.md`):** O portfólio opera sob duas arquiteturas de software sob orçamento *wall-clock*: ALNS e ILS utilizam controle em Python com delegação da busca local para o motor C++ do PyVRP, enquanto GLS e TS executam integralmente sobre o solver em C++ do Google OR-Tools. Essa distinção faz parte da definição operacional dos solvers disponíveis para o sistema de AAS.
+- **Nota técnica sobre implementação e métricas de Seleção de Algoritmos (a documentar em `params_log.md` e no artigo):**
+  - ALNS, ILS e HGS operam sob a mesma arquitetura híbrida (laço metaheurístico em Python + busca local exaustiva em C++ via PyVRP), enquanto o GLS executa no solver C++ do OR-Tools.
+  - Como ALNS, ILS e HGS compartilham o mesmo motor C++ de busca local e a mesma solução inicial PCI, suas trajetórias convergem frequentemente para o mesmo ótimo local ou para soluções com diferenças residuais ($< 0{,}10\%$ de gap). Por esse motivo, na avaliação de **Seleção Automática de Algoritmos (AAS)**, além da acurácia rígida (`argmax`) e da acurácia dos modelos binários de *Footprint* ($Y_a \le \varepsilon$), deve-se reportar prioritariamente a **acurácia sensível a empates (`tie-aware accuracy`)** e o **Performance Regret médio (`mean regret`)** em relação ao Virtual Best Solver (VBS).
 
 ### 2.2 Orçamento de tempo
 
@@ -67,9 +76,10 @@ $$T(N) = \min(0.5 \times N,\ \text{cap})$$
 
 ### 2.3 Execução e checkpoints
 
-Para cada instância × cada um dos **4 algoritmos** do portfólio (`ALNS`, `ILS`, `GLS`, `TS`):
+Para cada instância × cada um dos **4 algoritmos** do portfólio (`ALNS`, `ILS`, `GLS`, `HGS`):
 - Rodar **3 vezes** com seeds diferentes, até o tempo $T(N)$.
-- Durante cada rodada, capturar o **custo da melhor solução incumbente** nos checkpoints de **25%, 50%, 75% e 100%** de $T(N)$ (via registrador temporal / callback de incumbente).
+- Durante cada rodada, capturar o **custo da melhor solução incumbente** nos checkpoints de **25%, 50%, 75% e 100%** de $T(N)$ (via registrador temporal / callback de incumbente; no HGS, via critério de parada instrumentado que registra o melhor custo viável por iteração).
+- **Resiliência de execução:** o orquestrador paralelo (`ProcessPoolExecutor`) tolera a morte abrupta de workers (OOM-kill / segfault em código nativo): em `BrokenProcessPool` o pool é recriado e apenas os jobs pendentes são reexecutados; um job que acompanha 3 quebras é descartado e registrado (reexecutável com `--resume`). Isso corrige o abort observado na campanha SSH (`BrokenProcessPool` em `executor.map`).
 - Ao final das 3 rodadas, calcular a **mediana** do custo incumbente em cada checkpoint, por instância e por algoritmo.
 
 **Output esperado desta etapa (`01_run_algorithms.py`):**
@@ -86,7 +96,7 @@ Extraídas durante a fase inicial de busca local do **ILS** (partindo da constru
 
 ## 3. Métrica de dificuldade / desempenho ($Y$)
 
-Para cada instância $i$ e algoritmo $a \in \{\text{ALNS}, \text{ILS}, \text{GLS}, \text{TS}\}$, usando o custo mediano no checkpoint de **100%** (solução final):
+Para cada instância $i$ e algoritmo $a \in \{\text{ALNS}, \text{ILS}, \text{GLS}, \text{HGS}\}$, usando o custo mediano no checkpoint de **100%** (solução final):
 
 $$Y_{i,a} = \frac{\text{custo}_{i,a}^{100\%} - BKS_i}{BKS_i}$$
 
@@ -179,7 +189,7 @@ O PRELIM normaliza colunas entre instâncias (Min-Max/Box-Cox), mas não remove 
 ## 5. PRELIM — ponto de decisão manual ($\varepsilon$)
 
 **Sub-etapa 5a — script `03_prelim_analyze.py` (roda até aqui e para):**
-1. Recebe $F$ (Seção 4) e $Y$ no checkpoint 100% (Seção 3, **4 colunas**: `ALNS`, `ILS`, `GLS`, `TS`).
+1. Recebe $F$ (Seção 4) e $Y$ no checkpoint 100% (Seção 3, **4 colunas**: `ALNS`, `ILS`, `GLS`, `HGS`).
 2. Calcula e reporta a distribuição de $Y$ (por algoritmo e agregada): média, desvio-padrão, mediana, percentis 10/25/50/75/90, proporção de zeros (empates com o BKS) e histograma.
 3. Propõe 2–3 valores candidatos de $\varepsilon$ (limiar de "bom" desempenho) com justificativa estatística.
 4. **Termina a execução aqui.** Não prossegue automaticamente para o SIFTED.
@@ -197,7 +207,7 @@ Parâmetros do PRELIM (configuráveis, com defaults abaixo):
 ## 6. SIFTED (`04_sifted.py`)
 
 1. **Filtro de Relevância com Regra de Contingência Automática:**
-   Calcular a correlação de Pearson $\vert{}r_{\text{feature}, Y_a}\vert{}$ para cada algoritmo $a \in \{\text{ALNS}, \text{ILS}, \text{GLS}, \text{TS}\}$ e reter features com $\vert{}r\vert{} \ge 0.3$ (limiar canônico do toolkit MATILDA, configurável via `--corr-threshold`) com pelo menos um dos 4 algoritmos. O código implementa salvaguarda canônica para garantir que haja candidatos suficientes para os $K=10$ clusters:
+   Calcular a correlação de Pearson $\vert{}r_{\text{feature}, Y_a}\vert{}$ para cada algoritmo $a \in \{\text{ALNS}, \text{ILS}, \text{GLS}, \text{HGS}\}$ e reter features com $\vert{}r\vert{} \ge 0.3$ (limiar canônico do toolkit MATILDA, configurável via `--corr-threshold`) com pelo menos um dos 4 algoritmos. O código implementa salvaguarda canônica para garantir que haja candidatos suficientes para os $K=10$ clusters:
 
    ```python
    # Trecho do 04_sifted.py:
@@ -241,7 +251,7 @@ Esta é a **única** projeção construída — o espaço $(Z_1, Z_2)$ permanece
 
 ## 8. Overlay dos checkpoints no espaço fixo (`06_visualize_overlays.py`)
 
-Com o espaço $(Z_1, Z_2)$ fixado na Seção 7, para cada um dos 4 checkpoints (25%, 50%, 75%, 100%) e cada um dos **4 algoritmos** (`ALNS`, `ILS`, `GLS`, `TS`):
+Com o espaço $(Z_1, Z_2)$ fixado na Seção 7, para cada um dos 4 checkpoints (25%, 50%, 75%, 100%) e cada um dos **4 algoritmos** (`ALNS`, `ILS`, `GLS`, `HGS`):
 
 $$Y_{i,a}^{\text{checkpoint}} = \frac{\text{custo}_{i,a}^{\text{checkpoint}} - BKS_i}{BKS_i}$$
 
@@ -269,8 +279,8 @@ Gerar, para cada checkpoint, um conjunto de gráficos de dispersão no mesmo $(Z
 
 | Parâmetro | Valor |
 |---|---|
-| Algoritmos comparados (4) | `ALNS` (SA Ropke & Pisinger), `ILS`, `GLS` (OR-Tools sintonizado), `TS` (OR-Tools Tabu Search) |
-| Heurística construtiva (fixa) | PCI (Parallel Cheapest Insertion) em todos os 4 algoritmos |
+| Algoritmos comparados (4) | `ALNS` (SA Ropke & Pisinger), `ILS`, `GLS` (OR-Tools sintonizado), `HGS` (PyVRP `GeneticAlgorithm`, defaults, semeado com PCI) |
+| Heurística construtiva (fixa) | PCI (Parallel Cheapest Insertion) em todos os 4 algoritmos (no HGS, semeia a população inicial) |
 | Orçamento de tempo | $T(N) = \min(0.5N,\ 100\text{s})$ |
 | Rodadas por instância/algoritmo | 3 (mediana) |
 | Checkpoints | 25%, 50%, 75%, 100% de $T(N)$ |
@@ -295,25 +305,27 @@ Esta seção consolida os pontos fortes, as limitações metodológicas e os arg
    - Gouvêa et al. (2025) reduzem o comportamento temporal do algoritmo a um único escalar (Primal Integral).
    - Notice et al. (2025) avaliam dois cortes de tempo (curto e longo), mas treinam projeções separadas para cada orçamento, alterando as features selecionadas e a geometria dos eixos $(Z_1, Z_2)$ entre os dois cenários.
    - **Diferencial deste trabalho:** Fixar a base de projeção $Z$ no orçamento completo (100%) e sobrepor os estados intermediários (25%, 50%, 75%, 100%) permite rastrear o deslocamento das fronteiras de dominância (*footprints*) ao longo do tempo sobre o mesmo sistema de coordenadas, conectando diretamente a análise de espaço de instâncias (ISA) ao problema de Seleção Automática de Algoritmos (AAS) sensível ao orçamento.
-2. **Isolamento Experimental da Fase de Melhoria:**
-   - Estudos anteriores comparam pacotes fechados onde a heurística construtiva varia entre os competidores (ex.: Clarke & Wright no FILO vs. inicialização populacional aleatória/construtiva no HGS). Ao fixar a construção via *Parallel Cheapest Insertion* (PCI) nos 4 métodos, este trabalho elimina a variável de confusão da solução inicial, garantindo que a separação no espaço de instâncias reflita exclusivamente a interação entre a topologia da instância e o mecanismo de busca local/escape de ótimos locais.
+2. **Duplo Isolamento Experimental (Mesma Construtiva PCI + Mesmo Motor C++ de Busca Local):**
+   - Estudos anteriores comparam pacotes fechados onde tanto a heurística construtiva quanto os operadores de busca local variam entre os competidores (ex.: Clarke & Wright + vizinhanças seletivas no FILO vs. inicialização populacional + `SWAP*` no HGS), tornando impossível saber se um solver venceu pelo mecanismo metaheurístico ou por ter um operador de busca local melhor.
+   - Ao fixar a construção via *Parallel Cheapest Insertion* (PCI) nos 4 métodos **e** compartilhar exatamente o mesmo motor C++ de busca local (`PyVRP` com 13 operadores + `SWAP*`) entre `ALNS`, `ILS` e `HGS`, este trabalho elimina simultaneamente a variável de confusão da solução inicial e a variável de confusão da camada de intensificação. A separação no espaço de instâncias passa a refletir puramente quando o controle populacional com crossover (`HGS`) supera a perturbação de trajetória única (`ILS`), a destruição/reconstrução LNS (`ALNS`) ou a penalização de atributos (`GLS`).
 3. **Densidade e Escala Amostral:**
    - O uso de 10.000 instâncias com BKS conhecidos representa um aumento de 5x a 50x em relação aos estudos recentes de ISA para CVRP (centenas de instâncias do DIMACS em Gouvêa et al., 2025; 1.938 instâncias em Notice et al., 2025), reduzindo a variância do erro *out-of-bag* (OOB) das Random Forests no SIFTED e aumentando a estabilidade da matriz linear do PILOT.
 
 ### 11.2 Pontos Fortes do Desenho Experimental
-- **Diversidade de paradigmas de trajetória:** O portfólio cobre quatro filosofias distintas de escape de ótimos locais (aceitação estocástica em vizinhança grande via ALNS-SA, perturbação intensiva via ILS, alteração da paisagem de busca via penalidades no GLS e restrição por memória de curto prazo no TS).
+- **Contraste controlado entre trajetória única e evolução populacional:** O portfólio cobre quatro filosofias distintas de escape de ótimos locais (aceitação estocástica em vizinhança grande via ALNS-SA, perturbação intensiva via ILS, alteração da paisagem de busca via penalidades no GLS e evolução populacional com gestão de diversidade no HGS), três delas sobre o mesmo motor de busca local em C++.
+- **Alinhamento estrutural das *Probing Features* com todo o portfólio PyVRP:** Como a sondagem inicial do ILS utiliza o mesmo motor C++ de busca local que educa os indivíduos do HGS e pole as soluções do ALNS, as features `P1`–`P11` capturam diretamente a rugosidade e a profundidade das bacias de atração para os três algoritmos (sem viés pró-ILS).
 - **Prevenção de *Data Leakage* e Escala Espacial:** A extração das *probing features* restrita à sondagem inicial e a padronização das coordenadas para o grid $[0, 1000]^2$ com normalização por $N$ evitam que a projeção linear degrade em um mero preditor do tamanho da instância ($N$) ou incorpore a própria variável resposta $Y$.
 - **Reprodutibilidade e Modularidade:** Pipeline assíncrono com parada obrigatória para inspeção da distribuição de $Y$ antes da binarização por $\varepsilon$ e salvaguardas automáticas de código no SIFTED.
 
 ### 11.3 Pontos Fracos e Riscos (Como Mitigar na Escrita do Artigo)
-1. **Ausência de métodos populacionais estado-da-arte no portfólio avaliado:**
-   - *Crítica esperada:* O HGS (usado para gerar os BKS) e o FILO superam consistentemente os solvers do OR-Tools (GLS/TS) e metaheurísticas de trajetória simples em benchmarks padrão.
-   - *Mitigação no texto:* Posicionar o artigo explicitamente como uma análise do comportamento de **metaheurísticas clássicas de trajetória única sob inicialização controlada**, e não como uma competição pelo estado-da-arte irrestrito do CVRP (ver texto da Seção 2.1).
+1. **Cobertura limitada de métodos estado-da-arte (apenas o HGS é incluído):**
+   - *Crítica esperada:* O HGS (incluído no portfólio e também usado para gerar os BKS) e o FILO superam consistentemente o GLS do OR-Tools e metaheurísticas de trajetória simples em benchmarks padrão; espera-se que o HGS domine grande parte do espaço, o que pode reduzir o poder discriminativo do AAS. Além disso, o FILO não está no portfólio.
+   - *Mitigação no texto:* Posicionar o artigo como uma análise do comportamento de **metaheurísticas clássicas de trajetória única sob inicialização controlada**, incluindo o HGS como representante populacional (também semeado com PCI), e não como uma competição pelo estado-da-arte irrestrito do CVRP (ver texto da Seção 2.1). Declarar a circularidade BKS-por-HGS.
 2. **Escala moderada do número de clientes ($N \in [30, 200]$):**
    - *Crítica esperada:* Instâncias de até 200 clientes são consideradas de pequeno a médio porte na literatura atual de CVRP, podendo apresentar alta taxa de soluções ótimas (empates em gap = 0%) após 100 segundos de execução.
    - *Mitigação no texto:* Destacar que a análise dos checkpoints prematuros (25% e 50% do tempo, equivalentes a apenas 3.75s–25s para $N=30$ e 25s–50s para $N=200$) captura a fase transitória de convergência onde os algoritmos apresentam maior divergência de desempenho e maior *performance regret*.
 3. **Assimetria de linguagem de implementação sob tempo de relógio (*wall-clock*):**
-   - *Crítica esperada:* ALNS e ILS possuem o laço de controle em Python (com busca local em C++ via PyVRP), enquanto GLS e TS rodam inteiramente em C++ no OR-Tools.
+   - *Crítica esperada:* ALNS e ILS possuem o laço de controle em Python (com busca local em C++ via PyVRP), enquanto GLS roda inteiramente em C++ no OR-Tools e o HGS usa o laço genético do PyVRP (Python) com operadores em C++.
    - *Mitigação no texto:* Documentar abertamente a arquitetura de software na seção experimental, esclarecendo que na aplicação prática de um sistema de AAS, o seletor escolhe entre implementações concretas disponíveis sob um orçamento de tempo real de CPU, tornando relevante mapear o impacto conjunto do algoritmo e de sua implementação no espaço de instâncias.
 
 ### 11.4 Veículos Alvo Recomendados para Submissão

@@ -1,6 +1,6 @@
 # Guia de Execução — Instance Space Analysis (ISA) para CVRP
 
-Este documento orienta a execução completa do pipeline de Instance Space Analysis (ISA) para o problema de Roteamento de Veículos Capacitado (CVRP), integrando os 4 algoritmos do portfólio canônico (**ALNS**, **ILS**, **GLS**, **TS**), a extração de 50 features estruturais e 11 probing features, a projeção linear analítica PILOT ($Z_1, Z_2$), e o overlay multi-checkpoint (25%, 50%, 75%, 100%) com delimitação de footprints e seleção de algoritmos (AAS).
+Este documento orienta a execução completa do pipeline de Instance Space Analysis (ISA) para o problema de Roteamento de Veículos Capacitado (CVRP), integrando os 4 algoritmos do portfólio canônico (**ALNS**, **ILS**, **GLS**, **HGS**), a extração de 50 features estruturais e 11 probing features, a projeção linear analítica PILOT ($Z_1, Z_2$), e o overlay multi-checkpoint (25%, 50%, 75%, 100%) com delimitação de footprints e seleção de algoritmos (AAS).
 
 ---
 
@@ -108,7 +108,7 @@ Na literatura canônica de Instance Space Analysis (*Smith-Miles & Muñoz, 2023*
    - Para estimar essa região contínua no plano 2D, calcula-se o **Convex Hull** (envoltório convexo bidimensional) que circunscreve todas as instâncias onde aquele algoritmo obteve o melhor resultado.
    - A área desse polígono relativa à área do Convex Hull global de todas as instâncias define a métrica formal **Normalized Area ($A$)** apresentada na Tabela 3 de Notice et al. (2025).
 3. **Por que gerar "com polígonos" e "sem polígonos"?**
-   - **Com Polígonos** (`checkpoint_overlays_best_selection.png`): Mostra as fronteiras territoriais contínuas de cada heurística, permitindo visualizar como o nicho de dominância do ALNS, ILS, GLS ou TS se expande ou retrai temporalmente nos 4 checkpoints.
+   - **Com Polígonos** (`checkpoint_overlays_best_selection.png`): Mostra as fronteiras territoriais contínuas de cada heurística, permitindo visualizar como o nicho de dominância do ALNS, ILS, GLS ou HGS se expande ou retrai temporalmente nos 4 checkpoints.
    - **Sem Polígonos** (`checkpoint_overlays_best_selection_points.png`): Exibe unicamente a dispersão dos pontos individuais coloridos por solver e com rótulos de instância, eliminando qualquer sobreposição visual ou ilusão de dominância em regiões esparsas.
 
 ---
@@ -148,11 +148,11 @@ python3 00_validate_inputs.py \
   --report outputs/campanha_ssh/input_validation.csv
 ```
 
-### Etapa 1 — Benchmark dos 4 Algoritmos (ALNS, ILS, GLS, TS) com Probing
+### Etapa 1 — Benchmark dos 4 Algoritmos (ALNS, ILS, GLS, HGS) com Probing
 ```bash
 python3 01_run_algorithms.py \
   --instances-dir "../../joao/instances/gaetano" \
-  --algorithms ALNS ILS GLS TS \
+  --algorithms ALNS ILS GLS HGS \
   --seeds 1001 2001 3001 \
   --workers 16 \
   --seconds-per-customer 0.5 \

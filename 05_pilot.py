@@ -217,7 +217,7 @@ def generate_pilot_plots(
 
     # 2. Footprint do Melhor Algoritmo ("Best Selection") (Superior Direito)
     ax2 = axes[0, 1]
-    algo_colors = {"ALNS": "#1f77b4", "GLS": "#ff7f0e", "ILS": "#2ca02c", "TS": "#d62728"}
+    algo_colors = {"ALNS": "#1f77b4", "GLS": "#ff7f0e", "ILS": "#2ca02c", "HGS": "#d62728"}
     for algo in df_y.columns:
         mask = (best_algo == algo)
         if np.any(mask):

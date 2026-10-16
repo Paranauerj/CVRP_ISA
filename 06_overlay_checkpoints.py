@@ -283,7 +283,7 @@ def plot_best_selection_evolution(
         "ALNS": "#1f77b4",  # Azul
         "GLS":  "#ff7f0e",  # Laranja
         "ILS":  "#2ca02c",  # Verde
-        "TS":   "#d62728",  # Vermelho
+        "HGS":  "#d62728",  # Vermelho
         "Tie":  "#7f7f7f",  # Cinza neutro para empates múltiplos
     }
 
@@ -356,7 +356,7 @@ def plot_summary_dashboard(
     fig.suptitle("Dinâmica Temporal da Busca Local no Espaço de Instâncias (Checkpoints 25% a 100%)",
                  fontsize=14, fontweight="bold")
 
-    algo_palette = {"ALNS": "#1f77b4", "GLS": "#ff7f0e", "ILS": "#2ca02c", "TS": "#d62728", "Tie": "#7f7f7f"}
+    algo_palette = {"ALNS": "#1f77b4", "GLS": "#ff7f0e", "ILS": "#2ca02c", "HGS": "#d62728", "Tie": "#7f7f7f"}
 
     # 1. Convergência Média por Checkpoint (Superior Esquerdo)
     ax1 = axes[0, 0]
@@ -474,7 +474,7 @@ def generate_params_log(
 | **ALNS** | Adaptive Large Neighborhood Search | Ropke & Pisinger (2006); operadores Shaw, Random e SISR com Simulated Annealing canônico |
 | **ILS** | Iterated Local Search | Lourenço, Martin & Stützle (2003); descida estrita com escape por perturbação dinâmica |
 | **GLS** | Guided Local Search | Voudouris & Tsang (1999); penalização contínua adaptativa via OR-Tools |
-| **TS** | Tabu Search | Glover (1989); memória de curto prazo com tenure configurável via OR-Tools |
+| **HGS** | Hybrid Genetic Search | Vidal (2022); algoritmo populacional (HGS via PyVRP, semeado com PCI) |
 | **Polishing C++** | PyVRP Local Search | SwapStar (Vidal, COR 2022), Relocate, 2-Opt, Exchange |
 | **Orçamento Temporal** | $T(N) = \\min(0.5N, 100\\text{{s}})$ | Escalonamento suave proporcional ao número de clientes |
 | **Repetições Estocásticas** | 3 sementes aleatórias por instância | Mediana de custos das 3 rodadas |

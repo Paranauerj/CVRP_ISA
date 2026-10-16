@@ -1,5 +1,5 @@
 """
-Comparação de Algoritmos para o CVRP — ALNS / ILS / GLS / TS
+Comparação de Algoritmos para o CVRP — ALNS / ILS / GLS / HGS
 ======================================================================
 
 ATENÇÃO — LEIA ANTES DE EDITAR
@@ -49,16 +49,17 @@ GLS   — Guided Local Search
                  use_full_path_lns=False [OFF → mais throughput];
                  use_cross_exchange=True; use_tsp_opt=True; use_relocate_neighbors=True
 
-TS    — Tabu Search
-    Referência : Glover (1989). ORSA Journal on Computing 1(3), 190–206.
-    Aceitação  : OR-Tools TABU_SEARCH (memória de curto prazo — movimentos recentes proibidos)
-    Ideia-chave: "Tabu search uses a flexible memory structure... Recently visited solutions
-                  are classified as 'tabu', preventing the search from revisiting them for a
-                  certain number of iterations." (Glover, 1989, p. 190)
+HGS   — Hybrid Genetic Search (Vidal, 2022), implementação PyVRP
+    Referência : Vidal (2022). Computers & Operations Research 140, 105643.
+    Implementação: pyvrp.GeneticAlgorithm (crossover SREX + busca local SWAP* + penalidades
+                  adaptativas + gestão de diversidade), parâmetros default do PyVRP.
+    Partida    : população inicial semeada com o PCI (+ soluções aleatórias p/ diversidade).
+    Incumbente : histórico real via critério de parada instrumentado (1 execução por job).
 
 PCI   — Construtiva comum a todos os algoritmos (Parallel Cheapest Insertion)
     Papel      : Isola o efeito da camada de busca, conforme o plano ISA (instructions.md).
-                 Todos os algoritmos partem da MESMA solução inicial.
+                 Todos os algoritmos partem da MESMA solução inicial (no HGS, ela é uma das
+                 soluções da população inicial).
 
 ─────────────────────────────────────────────────────────────────────────────────────────
 Requisitos:
@@ -75,7 +76,8 @@ import random
 import time
 import math
 from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import median
@@ -808,10 +810,7 @@ def run_ortools_solver(instance: Instance, seed: int, deadline: float, run_start
     )
 
     parameters = pywrapcp.DefaultRoutingSearchParameters()
-    if metaheuristic_name == "TS":
-        parameters.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.TABU_SEARCH
-    else:
-        parameters.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
+    parameters.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
 
     # Operadores de vizinhança — configuração validada por sweep de 240 configs (10s × 3 instâncias):
     # • use_full_path_lns = OFF: bloqueava ciclos de melhoria rápida; desligar aumenta throughput.
@@ -940,15 +939,92 @@ def run_gls(instance: Instance, seed: int, deadline: float, run_start: float) ->
     return run_ortools_solver(instance, seed, deadline, run_start, "GLS")
 
 
-def run_ts(instance: Instance, seed: int, deadline: float, run_start: float) -> list[tuple[float, float]]:
-    return run_ortools_solver(instance, seed, deadline, run_start, "TS")
+# ---------------------------------------------------------------------------
+# HGS — Hybrid Genetic Search (Vidal, 2022) via PyVRP (semeado com o PCI)
+# ---------------------------------------------------------------------------
+
+def run_hgs(instance: Instance, seed: int, deadline: float, run_start: float) -> list[tuple[float, float]]:
+    """HGS (Vidal, 2022) na implementação do PyVRP (`GeneticAlgorithm`, crossover SREX, busca local
+    com SWAP*, penalidades adaptativas e gestão de diversidade), parâmetros default do PyVRP.
+
+    - Partida: a população inicial é semeada com a solução PCI (a mesma de ALNS/ILS/GLS) mais
+      `min_pop_size - 1` soluções aleatórias, necessárias para diversidade genética inicial.
+    - Incumbente temporal real: capturado a cada indivíduo viável adicionado à população (1 execução por job).
+    - Custo: EUC_2D (nint) construído via `create_pyvrp_local_search`, idêntico ao BKS e aos demais solvers.
+    """
+    from pyvrp import GeneticAlgorithm, PenaltyManager, Population
+    from pyvrp.crossover import selective_route_exchange as srex
+    from pyvrp.diversity import broken_pairs_distance as bpd
+    from pyvrp.solve import SolveParams
+
+    params = SolveParams()
+    # CRÍTICO: usar create_pyvrp_local_search para construir o ProblemData a partir de
+    # instance.distance (EUC_2D nint). pyvrp.read() leria a EDGE_WEIGHT_SECTION com
+    # penalidades climáticas das instâncias LDG, otimizando a função objetivo errada!
+    data, ls, _ = create_pyvrp_local_search(instance, int(seed))
+    rng = RandomNumberGenerator(seed=int(seed))
+
+    pm = PenaltyManager.init_from(data, params.penalty)
+    raw_pop = Population(bpd, params.population)
+
+    pci_routes = [r for r in pci(instance) if r]
+    init_sol = Solution(data, pci_routes)
+    init_cost = solution_cost(pci_routes, instance.distance)
+
+    events: list[tuple[float, float]] = [(time.perf_counter() - run_start, init_cost)]
+    best_state = {"cost": init_cost}
+
+    class _TrackingPopulation:
+        """Wrapper leve sobre Population que intercepta cada solução viável adicionada
+        para registar o custo euclidiano exato e o timestamp real dos checkpoints."""
+        def __init__(self, inner: Population):
+            self._inner = inner
+
+        def add(self, solution: Solution, cost_evaluator: CostEvaluator) -> None:
+            self._inner.add(solution, cost_evaluator)
+            if solution.is_feasible():
+                c = float(solution.distance())
+                if c < best_state["cost"]:
+                    best_state["cost"] = c
+                    events.append((time.perf_counter() - run_start, c))
+
+        def __getattr__(self, name: str):
+            return getattr(self._inner, name)
+
+        def __len__(self) -> int:
+            return len(self._inner)
+
+    pop = _TrackingPopulation(raw_pop)
+
+    init = [init_sol]
+    init += [Solution.make_random(data, rng) for _ in range(max(0, params.population.min_pop_size - 1))]
+
+    def _stop(_best_cost: float) -> bool:
+        return time.perf_counter() >= deadline
+
+    algo = GeneticAlgorithm(data, pm, rng, pop, ls, srex, init, params.genetic)
+    result = algo.run(_stop, collect_stats=False, display=False)
+
+    if result.best is not None and result.best.is_feasible():
+        best_routes = [[int(c) for c in r.visits()] for r in result.best.routes()]
+    else:
+        best_routes = pci_routes
+
+    validate_solution(best_routes, instance.demand, instance.capacity, len(instance.demand), "HGS")
+    exact_cost = solution_cost(best_routes, instance.distance)
+    if exact_cost < best_state["cost"]:
+        best_state["cost"] = exact_cost
+    events.append((min(max(0.0, deadline - run_start), time.perf_counter() - run_start), best_state["cost"]))
+    return events
 
 
 # ---------------------------------------------------------------------------
 # Orquestração / checkpoints / CSV
 # ---------------------------------------------------------------------------
 
-RUNNERS = {"ALNS": run_alns, "ILS": run_ils, "GLS": run_gls, "TS": run_ts}
+RUNNERS = {"ALNS": run_alns, "ILS": run_ils, "GLS": run_gls, "HGS": run_hgs}
+
+MAX_JOB_ATTEMPTS = 3  # nº de quebras de pool toleradas por job antes de descartá-lo
 
 
 def run_one(instance: Instance, algorithm: str, seed: int, seconds_per_customer: float, cap: float, fixed_budget: float | None = None) -> tuple[list[dict], dict | None]:
@@ -975,10 +1051,14 @@ def run_one(instance: Instance, algorithm: str, seed: int, seconds_per_customer:
         monotonic_events.append((t_el, running_best))
 
     rows = []
+    earliest_cost = monotonic_events[0][1] if monotonic_events else running_best
+    prev_best = float("inf")
     for fraction in checkpoints:
         target = budget * fraction
         eligible = [c for t_el, c in monotonic_events if t_el <= target + 0.05]
-        best_at_target = min(eligible) if eligible else running_best
+        best_at_target = min(eligible) if eligible else earliest_cost
+        best_at_target = min(prev_best, best_at_target)
+        prev_best = best_at_target
         rows.append({
             "instancia_id": instance.instance_id,
             "algoritmo": algorithm,
@@ -997,7 +1077,7 @@ def run_job(job: tuple[str, str, int, float, float, float | None]) -> tuple[list
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Comparacao de Algoritmos para o CVRP: ALNS / ILS / GLS / TS")
+    parser = argparse.ArgumentParser(description="Comparacao de Algoritmos para o CVRP: ALNS / ILS / GLS / HGS")
     parser.add_argument("--instances-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path, default=Path("checkpoint_costs_raw.csv"))
     parser.add_argument("--median-output", type=Path, default=Path("checkpoint_costs_median.csv"))
@@ -1005,7 +1085,7 @@ def main() -> int:
                         help="caminho para gravar as probing features brutas do ILS (default: ils_trace.csv)")
     parser.add_argument("--ils-median-output", type=Path, default=Path("ils_probing_median.csv"),
                         help="caminho para gravar as probing features medianas do ILS (default: ils_probing_median.csv)")
-    parser.add_argument("--algorithms", nargs="+", choices=("ALNS", "ILS", "GLS", "TS"), default=("ALNS", "ILS", "GLS", "TS"))
+    parser.add_argument("--algorithms", nargs="+", choices=("ALNS", "ILS", "GLS", "HGS"), default=("ALNS", "ILS", "GLS", "HGS"))
     parser.add_argument("--seeds", nargs="+", type=int, default=(1001, 2001, 3001))
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--seconds-per-customer", type=float, default=0.5)
@@ -1150,9 +1230,57 @@ def main() -> int:
                 c_rows, p_data = run_job(job)
                 save_single_result(c_rows, p_data)
         else:
-            with ProcessPoolExecutor(max_workers=args.workers) as executor:
-                for c_rows, p_data in executor.map(run_job, pending_jobs):
-                    save_single_result(c_rows, p_data)
+            # Execução resiliente: um worker que morre abruptamente (SIGKILL/OOM do SO, segfault
+            # em código nativo — OR-Tools / PyVRP / HGS) derruba TODO o ProcessPoolExecutor com
+            # BrokenProcessPool. Em vez de abortar a campanha inteira, recriamos o pool e
+            # reexecutamos os jobs ainda não concluídos; um job em voo que acompanha
+            # MAX_JOB_ATTEMPTS quebras de pool é registado como falho e saltado (pode ser
+            # retomado depois com --resume).
+            remaining = list(pending_jobs)
+            attempts: dict[tuple, int] = defaultdict(int)
+            failed_jobs: list[tuple] = []
+            while remaining:
+                broken = False
+                with ProcessPoolExecutor(max_workers=args.workers) as executor:
+                    futures = [executor.submit(run_job, job) for job in remaining]
+                    future_to_job = dict(zip(futures, remaining))
+                    completed_futures = set()
+                    for future in as_completed(futures):
+                        job = future_to_job[future]
+                        try:
+                            c_rows, p_data = future.result()
+                        except BrokenProcessPool:
+                            broken = True
+                            break
+                        except Exception as exc:  # erro Python normal dentro do job
+                            print(f"[ERRO] job {Path(job[0]).stem}/{job[1]}/seed={job[2]} falhou: {exc!r}", flush=True)
+                            failed_jobs.append(job)
+                            completed_futures.add(future)
+                            continue
+                        save_single_result(c_rows, p_data)
+                        completed_futures.add(future)
+                    if broken:
+                        executor.shutdown(wait=False, cancel_futures=True)
+                remaining = [future_to_job[f] for f in futures if f not in completed_futures]
+                if not broken:
+                    break
+                print(f"[AVISO] Pool de processos quebrou (worker morto — provável OOM/segfault). "
+                      f"Recriando pool com {len(remaining)} jobs restantes.", flush=True)
+                # Não sabemos qual job matou o pool: penaliza os primeiros (em voo) de cada quebra
+                for job in remaining[:args.workers]:
+                    attempts[job] += 1
+                still = []
+                for job in remaining:
+                    if attempts[job] >= MAX_JOB_ATTEMPTS:
+                        print(f"[FALHA] Descartando {Path(job[0]).stem}/{job[1]}/seed={job[2]} após "
+                              f"{MAX_JOB_ATTEMPTS} quebras de pool.", flush=True)
+                        failed_jobs.append(job)
+                    else:
+                        still.append(job)
+                remaining = still
+            if failed_jobs:
+                print(f"[AVISO] {len(failed_jobs)} jobs falharam e ficaram sem resultado "
+                      f"(reexecute com --resume para tentar novamente).", flush=True)
 
     raw_handle.close()
     if probing_handle:
