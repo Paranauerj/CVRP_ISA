@@ -94,15 +94,17 @@ Extraídas durante a fase inicial de busca local do **ILS** (partindo da constru
 
 ---
 
-## 3. Métrica de dificuldade / desempenho ($Y$)
+## 3. Métrica de dificuldade / desempenho ($Y$) e Âncora de Referência ($BKS$ vs. $VBS$)
 
 Para cada instância $i$ e algoritmo $a \in \{\text{ALNS}, \text{ILS}, \text{GLS}, \text{HGS}\}$, usando o custo mediano no checkpoint de **100%** (solução final):
 
 $$Y_{i,a} = \frac{\text{custo}_{i,a}^{100\%} - BKS_i}{BKS_i}$$
 
-$Y$ é, portanto, uma **matriz de 4 colunas** (uma para cada algoritmo do portfólio) — é essa matriz que alimenta o PRELIM, o SIFTED e o PILOT.
+$Y$ é, portanto, uma **matriz de 4 colunas** (uma para cada algoritmo do portfólio) — é essa matriz contínua que alimenta o PRELIM, o SIFTED e o PILOT.
 
-Os gaps nos checkpoints de 25%, 50% e 75% **não** entram no treinamento da projeção (PRELIM/SIFTED/PILOT) — eles são armazenados em `Y_all_checkpoints.parquet` e usados na Seção 8 para colorir o espaço de instâncias fixo em diferentes fases do orçamento.
+- **Por que ancorar no $BKS_i$ externo (e não no *Virtual Best Solver* interno $\min_a \text{custo}_{i,a}$)?**
+  Em análises estáticas de orçamento único, o MATILDA frequentemente usa o melhor algoritmo do próprio portfólio como referência (`opts.perf.rel = true`). Contudo, como o diferencial deste estudo é a **análise dinâmica *anytime* (25%, 50%, 75%, 100%)**, normalizar pelo melhor solver interno em cada checkpoint zeraria artificialmente o gap do vencedor momentâneo em 25% do tempo (mesmo quando todos os algoritmos ainda estão longe do ótimo). Ancorar $Y_{i,a}^{(t)}$ no $BKS_i$ externo fixo (custo euclidiano `EUC_2D` `nint`, conforme Notice et al., 2025) garante uma régua invariante no tempo, permitindo visualizar a expansão real dos *Good Footprints* de 25% até 100% do orçamento.
+- Os gaps nos checkpoints de 25%, 50% e 75% **não** entram no treinamento da projeção (PRELIM/SIFTED/PILOT) — eles são armazenados em `Y_all_checkpoints.parquet` e usados na Seção 8 para colorir o espaço de instâncias fixo em diferentes fases do orçamento.
 
 ---
 
@@ -187,16 +189,23 @@ O PRELIM normaliza colunas entre instâncias (Min-Max/Box-Cox), mas não remove 
 
 ---
 
-## 5. PRELIM — ponto de decisão manual ($\varepsilon$)
+## 5. PRELIM — ponto de decisão manual / automático de $\varepsilon$ (`03_prelim.py`)
 
-**Sub-etapa 5a — script `03_prelim_analyze.py` (roda até aqui e para):**
+**Sub-etapa 5a — análise da distribuição de $Y$ (`03_prelim.py --step analyze`):**
 1. Recebe $F$ (Seção 4) e $Y$ no checkpoint 100% (Seção 3, **4 colunas**: `ALNS`, `ILS`, `GLS`, `HGS`).
-2. Calcula e reporta a distribuição de $Y$ (por algoritmo e agregada): média, desvio-padrão, mediana, percentis 10/25/50/75/90, proporção de zeros (empates com o BKS) e histograma.
-3. Propõe 2–3 valores candidatos de $\varepsilon$ (limiar de "bom" desempenho) com justificativa estatística.
-4. **Termina a execução aqui.** Não prossegue automaticamente para o SIFTED.
+2. Calcula e reporta a distribuição de $Y$ (por algoritmo e agregada): média, desvio-padrão, mediana, percentis 10/25/50/75/90, proporção de zeros (empates com o BKS) e histograma (`prelim_distribution.png`).
+3. Propõe 3 valores candidatos de $\varepsilon$ (limiar de "bom" desempenho: $Y_{i,a} \le \varepsilon \implies 1\text{ [Bom]}, \text{senão } 0\text{ [Ruim]}$):
+   - **Candidato 1 ($P_{50}$ — Mediana Empírica Global, padrão canônico MATILDA):** Garante partição exatamente balanceada (50% de pares `(instância, algoritmo)` bons / 50% ruins), conforme recomendado por Smith-Miles & Muñoz (2023) e Muñoz et al. (2018). No benchmark de 60 instâncias, $P_{50} = 0.0117$ ($\approx 1.17\%$ de gap acima do BKS), valor que coincide naturalmente com a tolerância estrita de domínio ($\sim 0.5\%\text{–}1.0\%$) usada por Notice et al. (2025) para solvers estado-da-arte de CVRP.
+   - **Candidato 2 ($P_{25}$ — Primeiro Quartil):** Critério mais restritivo (apenas o top 25% das execuções é considerado bom; $\approx 0.67\%$ no benchmark de 60 instâncias).
+   - **Candidato 3 ($\varepsilon = 0.01\text{ ou }0.05$ — Tolerância Fixa):** Em portfólios de alta qualidade (onde PyVRP C++ mantém $P_{75} < 2.2\%$), um limiar frouxo de $5\%$ classificaria $>95\%$ das instâncias como boas, inflando artificialmente a área dos *footprints* e impedindo que classificadores aprendam fronteiras reais.
+4. No modo manual (`--step analyze`), termina a execução para revisão humana; no modo automatizado (`--step both`, usado por `run_pipeline.py` quando `--epsilon` não é forçado), adota automaticamente o **Candidato 1 ($P_{50}$)** e grava o valor em `prelim_summary.json` na chave `"chosen_epsilon"`, que é lida automaticamente pelas etapas seguintes (`06_overlay_checkpoints.py` e `run_pipeline.py`).
 
-**Sub-etapa 5b — execução do pré-processamento (`03b_prelim_transform.py --epsilon <valor>`):**
-O usuário revisa o relatório da Sub-etapa 5a, decide $\varepsilon$ manualmente e executa a transformação PRELIM gerando `F_norm.parquet`, `Y_norm.parquet` e a matriz binária `Y_bin.parquet` (10.000 × 4).
+**Sub-etapa 5b — execução do pré-processamento (`03_prelim.py --step transform --epsilon <valor>`):**
+Gera `F_norm.parquet`, `Y_norm.parquet` e a matriz binária `Y_bin.parquet` ($N \times 4$).
+- **Onde $\varepsilon$ interfere (e onde NÃO interfere):**
+  - **NÃO altera SIFTED nem PILOT:** O filtro de correlação, os $K=10$ clusters, as 4 Random Forests de regressão (`04_sifted.py`) e a projeção linear $(Z_1, Z_2)$ (`05_pilot.py`) usam exclusivamente o gap contínuo normalizado (`Y_norm.parquet`).
+  - **NÃO altera o mapa de `Melhor Algoritmo` (*Best Solver*):** A seleção multiclasse ($\arg\min_a Y_{i,a}^{(t)}$) compara os gaps contínuos diretamente.
+  - **Altera diretamente os *Good Footprints* e a Acurácia Binária:** $\varepsilon$ define `Y_bin.parquet`, determinando os polígonos de *Good Footprint* (Área, Densidade e Pureza) e o balanceamento de classes dos classificadores binários por algoritmo.
 
 Parâmetros do PRELIM (configuráveis, com defaults abaixo):
 - $\phi_{max}$ = `False` (minimização)
@@ -250,29 +259,30 @@ Esta é a **única** projeção construída — o espaço $(Z_1, Z_2)$ permanece
 
 ---
 
-## 8. Overlay dos checkpoints no espaço fixo (`06_visualize_overlays.py`)
+## 8. Overlay dos checkpoints no espaço fixo (`06_overlay_checkpoints.py`)
 
-Com o espaço $(Z_1, Z_2)$ fixado na Seção 7, para cada um dos 4 checkpoints (25%, 50%, 75%, 100%) e cada um dos **4 algoritmos** (`ALNS`, `ILS`, `GLS`, `HGS`):
+Com o espaço $(Z_1, Z_2)$ fixado na Seção 7 e o limiar $\varepsilon$ lido automaticamente de `prelim_summary.json` (`"chosen_epsilon"`), para cada um dos 4 checkpoints (25%, 50%, 75%, 100%) e cada um dos **4 algoritmos** (`ALNS`, `ILS`, `GLS`, `HGS`):
 
 $$Y_{i,a}^{\text{checkpoint}} = \frac{\text{custo}_{i,a}^{\text{checkpoint}} - BKS_i}{BKS_i}$$
 
-Gerar, para cada checkpoint, um conjunto de gráficos de dispersão no mesmo $(Z_1, Z_2)$:
-- Um subplot por algoritmo (4 subplots por checkpoint), colorido pelo gap contínuo e pelo indicador binário de bom desempenho.
-- Um plot "Melhor Algoritmo" por instância naquele checkpoint (menor gap entre os **4 algoritmos**, destacando empates).
-- Cálculo de área, densidade e pureza dos *footprints* e distribuição do *performance regret* em cada checkpoint.
+Gerar, no mesmo $(Z_1, Z_2)$:
+- `checkpoint_overlays_algorithms.png`: grade $4 \times 4$ (checkpoints × algoritmos) colorida pelo gap contínuo e pelo indicador binário de bom desempenho ($Y_{i,a}^{\text{checkpoint}} \le \varepsilon$).
+- `checkpoint_overlays_best_selection.png` e `checkpoint_overlays_best_selection_points.png`: evolução do "Melhor Algoritmo" por instância em cada checkpoint (menor gap entre os **4 algoritmos**, com fronteiras de decisão SVM e destaque para empates `Tie`).
+- **`footprints_checkpoint_25.png`, `footprints_checkpoint_50.png`, `footprints_checkpoint_75.png`, `footprints_checkpoint_100.png`:** 4 figuras dedicadas (uma por checkpoint, em grade $2 \times 2$ para `ALNS`, `ILS`, `GLS` e `HGS`), exibindo os polígonos convexos/alpha-shapes do *Good Footprint* ($\text{Gap} \le \varepsilon$) e do *Best Footprint* (vencedor estrito ou empatado), juntamente com as métricas topológicas MATILDA de Área ($A$), Densidade ($D$) e Pureza ($P$).
+- `checkpoint_evolution_summary.png` e `checkpoint_metrics.csv`: cálculo completo de área, densidade e pureza dos *footprints*, vitórias estritas/empatadas e distribuição do *performance regret* em cada checkpoint.
 
 ---
 
 ## 9. Outputs finais esperados (checklist de entrega)
 
-1. `F_raw.parquet` e `F_norm.parquet` — matrizes de características bruta e normalizada (10.000 × features).
-2. `Y.parquet` — gaps por instância × 4 algoritmos × 4 checkpoints (25/50/75/100%).
-3. Relatório da Seção 5 (distribuição de $Y$ nos 4 algoritmos, candidatos de $\varepsilon$).
-4. Artefatos do SIFTED: correlações, clusters ($K=10$), combinação vencedora, erros OOB das 4 RFs.
-5. `Z_matrix.json` — matriz de projeção PILOT $2 \times 10$.
+1. `F_raw.parquet`, `F.parquet`, `F_norm.parquet` e `F_sifted.parquet` — matrizes de características bruta, limpa de variância zero, normalizada e selecionada ($N \times 10$).
+2. `Y.parquet` e `Y_all_checkpoints.parquet` — gaps por instância × 4 algoritmos × 4 checkpoints (25/50/75/100%).
+3. `prelim_report.md`, `prelim_summary.json` e `prelim_distribution.png` — relatório da Seção 5 (distribuição de $Y$ nos 4 algoritmos, candidatos de $\varepsilon$ e `"chosen_epsilon"`).
+4. Artefatos do SIFTED: `sifted_selected_features.json`, `sifted_report.md`, `sifted_clusters.png` (correlações, clusters $K=10$, combinação vencedora, erros OOB das 4 RFs).
+5. `Z_matrix.json`, `pilot_summary.json` e `pilot_report.md` — matriz de projeção PILOT $2 \times 10$ e métricas de topologia/regressão linear.
 6. `projected_coords.parquet` — $(Z_1, Z_2)$ por instância.
-7. Gráficos do espaço de instâncias — distribuição de features + overlays por checkpoint/algoritmo da Seção 8.
-8. `params_log.md` — log com todos os parâmetros usados ($\varepsilon$ escolhido e justificativa, $K=10$, construção PCI fixa, $T(N)$, nº de rodadas, arquitetura dos solvers).
+7. Gráficos do espaço de instâncias e dinâmica temporal (`instance_space_pilot.png`, `feature_distribution_maps.png`, `checkpoint_overlays_algorithms.png`, `checkpoint_overlays_best_selection.png`, `checkpoint_overlays_best_selection_points.png`, `checkpoint_evolution_summary.png`, e os 4 mapas de footprints `footprints_checkpoint_{25,50,75,100}.png`).
+8. `PIPELINE_SUMMARY.md` e `checkpoint_overlay_report.md` — relatórios consolidados com todos os parâmetros, métricas MATILDA e evolução temporal.
 
 ---
 
@@ -286,9 +296,9 @@ Gerar, para cada checkpoint, um conjunto de gráficos de dispersão no mesmo $(Z
 | Rodadas por instância/algoritmo | 3 (mediana) |
 | Checkpoints | 25%, 50%, 75%, 100% de $T(N)$ |
 | Nº de instâncias | 10.000 ($N \in [30, 200]$) |
-| Fonte de $Y$ | Gap vs. BKS no checkpoint 100% (**matriz de 4 colunas**) |
+| Fonte de $Y$ | Gap relativo ao $BKS_i$ externo no checkpoint 100% (**matriz de 4 colunas**) |
 | Fonte das probing features | Sondagem local inicial do ILS (`outputs/ils_probing_median.csv`) |
-| $\varepsilon$ | **Decisão manual do usuário após revisar a distribuição de $Y$ (Seção 5)** |
+| $\varepsilon$ | **Mediana empírica global $P_{50}$ em 100% do orçamento** (ou decisão manual via `--epsilon`), salva em `prelim_summary.json` (`chosen_epsilon`) e propagada automaticamente para `06_overlay_checkpoints.py` |
 | $\phi_{max} / \phi_{bnd} / \phi_{nrm}$ | `False` / `False` / `False` |
 | Filtro SIFTED | $|r| \ge 0.3$ (limiar MATILDA canônico, configurável via `--corr-threshold`) com *fallback* automático para `top k_clusters` |
 | $K$ (SIFTED) | 10, fixo (com salvaguarda `k_eff = min(10, len(features))`) |

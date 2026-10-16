@@ -339,6 +339,209 @@ def plot_best_selection_evolution(
     print(f"[OK] Painel de 'Best Selection' ({'com polígonos' if show_polygons else 'sem polígonos'}) salvo em: {output_png}")
 
 
+def plot_algorithm_footprints_per_checkpoint(
+    df_consolidated: pd.DataFrame,
+    df_footprints: pd.DataFrame,
+    checkpoints: list[int],
+    algorithms: list[str],
+    epsilon: float,
+    output_dir: Path,
+) -> list[Path]:
+    """
+    Gera 4 novos PNGs (um para cada checkpoint: 25%, 50%, 75%, 100%):
+      - `footprints_checkpoint_25.png`
+      - `footprints_checkpoint_50.png`
+      - `footprints_checkpoint_75.png`
+      - `footprints_checkpoint_100.png`
+    Cada PNG contém uma grade 2x2 (1 subplot por algoritmo: ALNS, GLS, HGS, ILS) exibindo:
+      - O envoltório convexo do Espaço de Instâncias total (contorno tracejado cinza);
+      - As instâncias com Desempenho Ruim (Gap > epsilon, pontos cinza-claros);
+      - O Footprint de Bom Desempenho (Gap <= epsilon, pontos coloridos + polígono preenchido);
+      - O Footprint de Melhor Algoritmo / Vitória (estrelas destacadas + contorno tracejado escuro);
+      - Caixa de métricas MATILDA no canto (Área A, Densidade D, Pureza P de Good e Best).
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    algo_palette = {
+        "ALNS": "#1f77b4",  # Azul
+        "GLS":  "#ff7f0e",  # Laranja
+        "ILS":  "#2ca02c",  # Verde
+        "HGS":  "#d62728",  # Vermelho
+    }
+
+    df_unique = df_consolidated.drop_duplicates(subset=["instancia_id"])
+    Z_all = df_unique[["Z1", "Z2"]].values
+    hull_all = None
+    if len(Z_all) >= 3:
+        try:
+            hull_all = ConvexHull(Z_all)
+        except Exception:
+            hull_all = None
+
+    saved_paths: list[Path] = []
+    n_algs = len(algorithms)
+    n_cols = 2 if n_algs > 1 else 1
+    n_rows = int(np.ceil(n_algs / n_cols))
+
+    for cp in checkpoints:
+        sub_cp = df_consolidated[df_consolidated["checkpoint"] == cp]
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(6.5 * n_cols, 5.5 * n_rows), sharex=True, sharey=True, squeeze=False)
+        fig.suptitle(
+            f"Footprints dos Algoritmos no Espaço de Instâncias — Checkpoint {cp}% de T(N)  (Limiar ε = {epsilon*100:.2f}%)",
+            fontsize=14,
+            fontweight="bold",
+        )
+
+        for idx, alg in enumerate(algorithms):
+            r, c = divmod(idx, n_cols)
+            ax = axes[r, c]
+            color = algo_palette.get(alg, "#1f77b4")
+
+            # 1. Contorno do espaço total de instâncias
+            if hull_all is not None:
+                hull_pts = Z_all[hull_all.vertices]
+                poly_space = MplPolygon(
+                    hull_pts,
+                    facecolor="#f8f9fa",
+                    edgecolor="#adb5bd",
+                    alpha=0.5,
+                    linestyle=":",
+                    linewidth=1.2,
+                    zorder=1,
+                    label="Fronteira do Espaço Total",
+                )
+                ax.add_patch(poly_space)
+
+            # 2. Máscaras de Good (Gap <= epsilon) e Best (vencedor no checkpoint)
+            gaps = sub_cp[f"{alg}_gap"].values
+            good_mask = gaps <= epsilon
+            bad_mask = ~good_mask
+            best_mask = (sub_cp["best_algo"] == alg).values
+
+            # Pontos Bad (Gap > epsilon)
+            if np.any(bad_mask):
+                ax.scatter(
+                    sub_cp.loc[bad_mask, "Z1"],
+                    sub_cp.loc[bad_mask, "Z2"],
+                    color="#ced4da",
+                    edgecolor="#6c757d",
+                    s=65,
+                    alpha=0.65,
+                    label=f"Ruim: Gap > ε ({int(np.sum(bad_mask))} inst)",
+                    zorder=2,
+                )
+
+            # Polígono e pontos do Good Footprint (Gap <= epsilon)
+            if np.any(good_mask):
+                pts_good = sub_cp.loc[good_mask, ["Z1", "Z2"]].values
+                pts_good_hull = filter_footprint_outliers(pts_good)
+                if len(pts_good_hull) >= 3:
+                    try:
+                        h_good = ConvexHull(pts_good_hull)
+                        poly_good = MplPolygon(
+                            pts_good_hull[h_good.vertices],
+                            facecolor=color,
+                            edgecolor=color,
+                            alpha=0.20,
+                            linestyle="-",
+                            linewidth=1.8,
+                            zorder=3,
+                            label="Footprint Bom (Polígono)",
+                        )
+                        ax.add_patch(poly_good)
+                    except Exception:
+                        pass
+                ax.scatter(
+                    sub_cp.loc[good_mask, "Z1"],
+                    sub_cp.loc[good_mask, "Z2"],
+                    color=color,
+                    edgecolor="black",
+                    s=85,
+                    alpha=0.88,
+                    label=f"Bom: Gap ≤ ε ({int(np.sum(good_mask))} inst)",
+                    zorder=4,
+                )
+
+            # Polígono e estrelas do Best Footprint (Vencedor estrito no checkpoint)
+            if np.any(best_mask):
+                pts_best = sub_cp.loc[best_mask, ["Z1", "Z2"]].values
+                pts_best_hull = filter_footprint_outliers(pts_best)
+                if len(pts_best_hull) >= 3:
+                    try:
+                        h_best = ConvexHull(pts_best_hull)
+                        poly_best = MplPolygon(
+                            pts_best_hull[h_best.vertices],
+                            facecolor="none",
+                            edgecolor="#111111",
+                            alpha=0.85,
+                            linestyle="--",
+                            linewidth=2.0,
+                            zorder=5,
+                            label="Footprint Vencedor (Best Hull)",
+                        )
+                        ax.add_patch(poly_best)
+                    except Exception:
+                        pass
+                ax.scatter(
+                    sub_cp.loc[best_mask, "Z1"],
+                    sub_cp.loc[best_mask, "Z2"],
+                    color="#ffd43b",
+                    edgecolor="black",
+                    marker="*",
+                    s=190,
+                    linewidth=1.0,
+                    label=f"Vencedor / Best ({int(np.sum(best_mask))} inst)",
+                    zorder=6,
+                )
+
+            # Métricas do algoritmo neste checkpoint
+            m_row = df_footprints[(df_footprints["checkpoint"] == cp) & (df_footprints["algoritmo"] == alg)]
+            if not m_row.empty:
+                mr = m_row.iloc[0]
+                metrics_txt = (
+                    f"Good Footprint: A={mr['good_area']:.3f} | D={mr['good_density']:.2f} | P={mr['good_purity']:.2f}\n"
+                    f"Best Footprint: A={mr['best_area']:.3f} | D={mr['best_density']:.2f} | P={mr['best_purity']:.2f}"
+                )
+            else:
+                metrics_txt = ""
+
+            ax.set_title(f"{alg} — Checkpoint {cp}%", fontweight="bold", fontsize=12)
+            if metrics_txt:
+                ax.text(
+                    0.02,
+                    0.03,
+                    metrics_txt,
+                    transform=ax.transAxes,
+                    fontsize=8.5,
+                    family="monospace",
+                    verticalalignment="bottom",
+                    bbox=dict(boxstyle="round,pad=0.35", facecolor="white", edgecolor=color, alpha=0.88),
+                    zorder=7,
+                )
+
+            ax.axhline(0, color="gray", linestyle=":", alpha=0.3)
+            ax.axvline(0, color="gray", linestyle=":", alpha=0.3)
+            ax.grid(True, linestyle=":", alpha=0.45)
+            if r == n_rows - 1:
+                ax.set_xlabel("Coordenada Z1", fontweight="bold")
+            if c == 0:
+                ax.set_ylabel("Coordenada Z2", fontweight="bold")
+            ax.legend(loc="upper left", fontsize=8, framealpha=0.9)
+
+        # Ocultar eixos extras caso n_algs seja ímpar
+        for idx in range(n_algs, n_rows * n_cols):
+            r, c = divmod(idx, n_cols)
+            axes[r, c].axis("off")
+
+        plt.tight_layout(rect=[0, 0, 1, 0.95])
+        out_path = output_dir / f"footprints_checkpoint_{cp}.png"
+        plt.savefig(out_path, dpi=300)
+        plt.close()
+        saved_paths.append(out_path)
+        print(f"[OK] Painel de Footprints do Checkpoint {cp}% salvo em: {out_path}")
+
+    return saved_paths
+
+
 def plot_summary_dashboard(
     df_consolidated: pd.DataFrame,
     checkpoints: list[int],
@@ -826,21 +1029,41 @@ def main() -> None:
     print(f"[OK] Tabela consolidada de gaps salva em CSV    : {args.out_checkpoints_csv}")
 
     # 6. Calcular Métricas de Footprint (Notice et al., 2025, Tabela 3 & Smith-Miles & Muñoz, 2023)
+    eff_epsilon = args.epsilon
+    for p_cand in [args.out_report_md.parent / "prelim_summary.json", Path("prelim_summary.json"), Path("outputs/prelim_summary.json")]:
+        if p_cand.is_file():
+            try:
+                with p_cand.open("r", encoding="utf-8") as f:
+                    p_info = json.load(f)
+                    if "chosen_epsilon" in p_info and args.epsilon == 0.05:
+                        eff_epsilon = float(p_info["chosen_epsilon"])
+                        break
+            except Exception:
+                pass
+
     df_footprints = compute_footprint_metrics(
         df_consolidated=df_consolidated,
         checkpoints=checkpoints,
         algorithms=algorithms,
-        epsilon=args.epsilon,
+        epsilon=eff_epsilon,
     )
     args.out_footprint_metrics.parent.mkdir(parents=True, exist_ok=True)
     df_footprints.to_csv(args.out_footprint_metrics, index=False)
-    print(f"[OK] Métricas de Footprint salvas em CSV        : {args.out_footprint_metrics}")
+    print(f"[OK] Métricas de Footprint salvas em CSV        : {args.out_footprint_metrics} (ε = {eff_epsilon:.4f})")
 
     # 7. Gerar Gráficos
     plot_algorithm_gap_overlays(df_consolidated, checkpoints, algorithms, args.out_plot_algorithms)
     plot_best_selection_evolution(df_consolidated, checkpoints, algorithms, args.out_plot_best, show_polygons=True)
     plot_best_selection_evolution(df_consolidated, checkpoints, algorithms, args.out_plot_best_points, show_polygons=False)
     plot_summary_dashboard(df_consolidated, checkpoints, algorithms, args.out_plot_summary)
+    plot_algorithm_footprints_per_checkpoint(
+        df_consolidated=df_consolidated,
+        df_footprints=df_footprints,
+        checkpoints=checkpoints,
+        algorithms=algorithms,
+        epsilon=eff_epsilon,
+        output_dir=args.out_plot_best.parent,
+    )
 
     # 8. Gerar params_log.md (Checklist de Entrega)
     generate_params_log(

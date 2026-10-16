@@ -170,12 +170,14 @@ Population-based metaheuristic: giant-tour crossover (OX) + education by local s
 
 ---
 
-## 8. MATILDA Framework — Performance Threshold ($\varepsilon$) in Instance Space Analysis
+## 8. MATILDA Framework — Performance Metric ($Y_{i,a}$), Reference Anchor (BKS vs. VBS), and Threshold ($\varepsilon$)
 
 ### Primary References
 > **Smith-Miles, K., & Muñoz, M. A. (2023).** "Instance Space Analysis for Algorithm Testing: Methodology and Software Tools." *ACM Computing Surveys*, 55(12), 1–33.
 >
 > **Muñoz, M. A., Villanova, L., Baatar, D., & Smith-Miles, K. (2018).** "Instance Spaces for Machine Learning Classification." *Machine Learning*, 107(1), 109–147.
+>
+> **Notice, M. J., et al. (2025).** "An Instance Space Analysis of the Capacitated Vehicle Routing Problem." *European Journal of Operational Research / Preprint*.
 >
 > **Gouvêa, A. M. M. M., Paulos, N., Uchoa, E., & Nascimento, M. C. V. (2025).** "Instance Space Analysis of the Capacitated Vehicle Routing Problem." In *Proceedings of the International Joint Conference on Neural Networks (IJCNN)*.
 
@@ -184,11 +186,24 @@ Population-based metaheuristic: giant-tour crossover (OX) + education by local s
 >
 > *"To avoid bias arising from arbitrary thresholding, the tolerance $\varepsilon$ can be set to a distribution quantile (such as the median or first quartile) of the metric $Y$."* — Muñoz et al. (2018, p. 118)
 
-### Application in this Study (PRELIM / SIFTED)
-In this CVRP ISA pipeline (Step 5, PRELIM):
-- **Performance Metric:** $Y_{i,a} = \frac{\text{cost}_{i,a}^{100\%} - BKS_i}{BKS_i}$ (relative gap to Best Known Solution at the 100% time checkpoint).
-- **Default Threshold:** Adaptive empirical **median of $Y$ ($\text{P50}$)** across the algorithm portfolio, following the canonical MATILDA standard.
-- **Academic Justification:** Gaps in this CVRP benchmark vary widely from $<1\%$ (e.g., `X-n101-k25`) to $>50\%$ (e.g., extreme weather/density instances like `LDG50` snow and `LDG160`). Adopting an arbitrary fixed threshold (such as $\varepsilon = 0.05$) would induce extreme class imbalance (>90% failures), crippling the ability of Random Forest / SVM classifiers to learn crisp algorithm boundaries. Adopting the distribution median guarantees a balanced 50/50 partition between "good" and "challenging" instances, maximizing statistical power and robustness against extreme outliers.
+### Comparison with CVRP & ISA Literature (How Other Studies Define $Y_{i,a}$ and $\varepsilon$)
+
+| Study / Reference | Performance Metric ($Y_{i,a}$) | Reference Anchor | Threshold ($\varepsilon$) for "Good" Performance | Rationale & Trade-offs |
+|---|---|---|---|---|
+| **Smith-Miles & Muñoz (2023)** *(MATILDA Standard)* | Relative gap to Virtual Best Solver (`opts.perf.rel = true`): $\frac{c_{i,a} - \min_{a'} c_{i,a'}}{\min_{a'} c_{i,a'}}$ or external target | Internal portfolio best ($\text{VBS}_i$) or external reference | **Adaptive empirical median ($P_{50}$)** of the $Y$ distribution (or strict competitive tolerance $\varepsilon \in [0.01, 0.05]$) | Guarantees a balanced 50/50 split between `Good` ($1$) and `Bad` ($0$) across the portfolio (`N×M` entries), preventing classifier starvation when training binary SVM/RF footprints. |
+| **Notice et al. (2025)** *(ISA for CVRP: HGS vs. FILO vs. Slack)* | Relative percentage deviation (RPD / Gap) to Best Known Solution: $\frac{c_{i,a} - BKS_i}{BKS_i}$ | External $BKS_i$ | **Strict domain tolerance ($\sim 0.5\%\text{–}1.0\%$)** to $BKS_i$ | Because state-of-the-art CVRP solvers routinely stay within $<2\%$ of $BKS_i$, a loose threshold ($5\%$) classifies almost every instance as "good" (`100%` footprint area), destroying discriminatory power. |
+| **Gouvêa et al. (2025)** *(ISA for CVRP — IJCNN)* | **Primal Integral (PI)** normalized over the execution horizon $[0, T_{\max}]$ | Trajectory integral relative to $BKS_i$ / initial solution | Quantile / relative tolerance over the Primal Integral distribution | Collapses the entire anytime convergence curve into a single scalar per run; cannot track how footprints expand across distinct checkpoints ($25\% \to 100\%$). |
+| **This Study (CVRP_ISA)** | Relative gap to external $BKS_i$ at each checkpoint $t \in \{25, 50, 75, 100\}\%$: $Y_{i,a}^{(t)} = \frac{c_{i,a}^{(t)} - BKS_i}{BKS_i}$ | External $BKS_i$ (pure `EUC_2D` `nint`, extracted from `.sol` / `bks.csv`) | **Adaptive empirical median ($P_{50}$) at 100% budget** ($\varepsilon = 0.0117 \approx 1.17\%$ in the 60-instance benchmark), saved automatically in `prelim_summary.json` (`chosen_epsilon`) | Combines both worlds: (1) anchoring to external $BKS_i$ (instead of internal VBS) provides a **time-invariant reference**, allowing *Good Footprints* to grow monotonically from $25\%$ to $100\%$; (2) setting $\varepsilon = P_{50}$ naturally lands at $\sim 1.17\%$, aligning with Notice et al.'s $\sim 1\%$ CVRP tolerance while preserving MATILDA's 50/50 statistical balance. |
+
+### Why External $BKS_i$ Instead of Internal VBS (`opts.perf.rel`)?
+In static single-budget ISA, MATILDA often normalizes performance against the internal Virtual Best Solver ($\text{VBS}_i = \min_a c_{i,a}$). However, in an **anytime checkpoint analysis ($25\%, 50\%, 75\%, 100\%$)**, using internal $\text{VBS}_i^{(t)}$ at each checkpoint would reset at least one solver to $\text{Gap} = 0\%$ even at $25\%$ of the time budget when all solvers are still far from the true optimum. By anchoring $Y_{i,a}^{(t)}$ to the fixed external $BKS_i$ and applying the fixed threshold $\varepsilon = P_{50}^{(100\%)}$ across all 4 checkpoints (`06_overlay_checkpoints.py`), we measure **true convergence toward optimality**: the *Good Footprint* ($Y_{i,a}^{(t)} \le \varepsilon$) expands organically as the time budget increases (e.g., `HGS` growing from $43.3\%$ at $25\%$ budget to $75.0\%$ at $100\%$ budget).
+
+### Impact of $\varepsilon$ on Pipeline Stages and Classifier Accuracy
+- **Does $\varepsilon$ affect SIFTED or PILOT?** **No.** Both SIFTED (`04_sifted.py`, Pearson correlation filter + $K=10$ clustering + 4 continuous Random Forest regressors) and PILOT (`05_pilot.py`, analytical projection matrix $\mathbf{Z} \in \mathbb{R}^{2 \times 10}$) operate strictly on the **continuous Box-Cox/Yeo-Johnson + Min-Max normalized performance matrix `Y_norm.parquet`**. Changing $\varepsilon$ does not alter the selected features or the 2D coordinates $(Z_1, Z_2)$.
+- **Does $\varepsilon$ affect Binary Footprint Classifiers and MATILDA Metrics?** **Yes.** The threshold $\varepsilon$ defines the binary target matrix `Y_bin.parquet` ($Y_{i,a} \le \varepsilon \implies 1\text{ [Good]}, \text{else } 0\text{ [Bad]}$), which directly governs:
+  1. The **Good Footprint** convex hulls/alpha-shapes and their MATILDA topological metrics (**Area $A$**, **Density $D$**, and **Purity $P$**) across all checkpoints.
+  2. The **binary classification accuracy** (SVM / Random Forest predicting whether algorithm $a$ will achieve $\text{Gap} \le \varepsilon$ on instance $i$ from $(Z_1, Z_2)$). Because the PyVRP C++ local search engine produces highly competitive gaps across the portfolio ($P_{75} < 2.2\%$), a naive fallback of $\varepsilon = 5\%$ would label $95\%\text{–}98\%$ of instances as `Good`, yielding a trivial majority-class accuracy without real decision boundary learning. Using the empirical median $\varepsilon = P_{50}$ ($\approx 1.17\%$) ensures balanced classes (`50% Good / 50% Bad` globally) and meaningful cross-validated classifier accuracies (`75.0%` for `ALNS`, `75.0%` for `ILS`, `80.0%` for `HGS`, and `96.7%` for `GLS`).
+- **Does $\varepsilon$ affect Multi-Class Algorithm Selection (`Best Solver`)?** **No.** The `Best Algorithm` map (`best_algorithm` in `instance_space_pilot.png` and `checkpoint_overlays_best_selection.png`) is determined strictly by $\arg\min_a Y_{i,a}^{(t)}$ (continuous gap comparison, with exact ties labeled `Tie`), independent of $\varepsilon$.
 
 ---
 
